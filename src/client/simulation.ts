@@ -13,17 +13,19 @@ import {
   CollateralResult,
   validateTrade,
 } from '../types/index.js';
+import { PriceService } from '../data/prices.js';
 import { FStatsClient } from '../data/fstats.js';
 import { getLogger } from '../utils/logger.js';
 import { getErrorMessage } from '../utils/retry.js';
 
 /**
  * SimulatedFlashClient implements IFlashClient for paper trading.
- * Uses live price feeds from fstats.io open positions.
+ * Uses CoinGecko prices as primary, fstats as enrichment, and hardcoded fallbacks.
  * No real transactions are ever submitted.
  */
 export class SimulatedFlashClient implements IFlashClient {
   private state: SimulationState;
+  private priceService: PriceService;
   private fstats: FStatsClient;
   private livePrices: Map<string, number> = new Map();
   readonly walletAddress: string;
@@ -35,17 +37,57 @@ export class SimulatedFlashClient implements IFlashClient {
       positions: [],
       tradeHistory: [],
     };
+    this.priceService = new PriceService();
     this.fstats = new FStatsClient();
+
+    // Seed with fallback prices immediately so trading always works
+    this.livePrices.set('SOL', 150);
+    this.livePrices.set('BTC', 65000);
+    this.livePrices.set('ETH', 3000);
+    this.livePrices.set('BNB', 600);
+    this.livePrices.set('ZEC', 30);
+    this.livePrices.set('JTO', 3);
+    this.livePrices.set('JUP', 1.2);
+    this.livePrices.set('PYTH', 0.4);
+    this.livePrices.set('RAY', 2);
+    this.livePrices.set('BONK', 0.00003);
+    this.livePrices.set('WIF', 2);
+    this.livePrices.set('PENGU', 0.01);
+    this.livePrices.set('ORE', 1.5);
+    this.livePrices.set('FARTCOIN', 0.5);
+    this.livePrices.set('PUMP', 0.01);
+    this.livePrices.set('HYPE', 20);
+    this.livePrices.set('MET', 0.5);
+    this.livePrices.set('KMNO', 0.1);
   }
 
   private async refreshPrices(): Promise<void> {
     const logger = getLogger();
+
+    // Primary: CoinGecko via PriceService
     try {
-      const raw = await this.fstats.getOpenPositions();
-      const positions = Array.isArray(raw) ? raw : [];
+      const symbols = Array.from(this.livePrices.keys());
+      const prices = await this.priceService.getPrices(symbols);
+      let updated = 0;
+      for (const [sym, tp] of prices) {
+        if (tp.price > 0) {
+          this.livePrices.set(sym, tp.price);
+          updated++;
+        }
+      }
+      if (updated > 0) {
+        logger.debug('SIM', `Updated ${updated} prices from PriceService`);
+      }
+    } catch (error: unknown) {
+      logger.warn('SIM', `PriceService failed: ${getErrorMessage(error)}`);
+    }
+
+    // Secondary: enrich with fstats open positions (may have additional markets)
+    try {
+      const positions = await this.fstats.getOpenPositions();
       const priceMap = new Map<string, number[]>();
       for (const p of positions) {
-        const sym = p.market_symbol ?? p.market;
+        const sym = (p.market_symbol ?? p.market ?? '').toUpperCase();
         const price = p.mark_price ?? p.entry_price;
         if (sym && price && typeof price === 'number' && price > 0) {
           if (!priceMap.has(sym)) priceMap.set(sym, []);
@@ -53,18 +95,17 @@ export class SimulatedFlashClient implements IFlashClient {
         }
       }
       for (const [sym, prices] of priceMap) {
-        this.livePrices.set(sym, prices.reduce((a, b) => a + b, 0) / prices.length);
+        const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+        // Only use fstats price if we don't have a CoinGecko price or fstats is likely fresher
+        if (!this.livePrices.has(sym) || this.livePrices.get(sym) === 0) {
+          this.livePrices.set(sym, avg);
+        }
       }
-      logger.debug('SIM', `Refreshed ${priceMap.size} market prices`);
     } catch (error: unknown) {
-      logger.warn('SIM', `Price refresh failed: ${getErrorMessage(error)}`);
-      // Seed fallback prices only if we have no data at all
-      if (this.livePrices.size === 0) {
-        this.livePrices.set('SOL', 140);
-        this.livePrices.set('BTC', 95000);
-        this.livePrices.set('ETH', 3200);
-      }
+      logger.debug('SIM', `fstats enrichment failed: ${getErrorMessage(error)}`);
     }
+
+    logger.debug('SIM', `Price data available for ${this.livePrices.size} markets`);
   }
 
   private getPrice(market: string): number {
@@ -238,7 +279,7 @@ export class SimulatedFlashClient implements IFlashClient {
       : Array.from(this.livePrices.keys());
 
     return symbols
-      .filter((s) => this.livePrices.has(s))
+      .filter((s) => this.livePrices.has(s) && this.livePrices.get(s)! > 0)
       .map((symbol) => ({
         symbol,
         price: this.livePrices.get(symbol)!,

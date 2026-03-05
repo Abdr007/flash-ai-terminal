@@ -10,8 +10,8 @@ import {
   IDataClient,
 } from '../types/index.js';
 import { FSTATS_BASE_URL } from '../config/index.js';
-import { withRetry } from '../utils/retry.js';
 import { getLogger } from '../utils/logger.js';
+import { getErrorMessage } from '../utils/retry.js';
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -83,7 +83,11 @@ interface RawOpenPosition {
   entry_price?: number;
 }
 
-async function fetchJson<T>(path: string): Promise<T> {
+/**
+ * Safe fetch with timeout and JSON validation.
+ * Returns null on failure instead of throwing.
+ */
+async function safeFetchJson<T>(path: string): Promise<T | null> {
   const url = `${FSTATS_BASE_URL}${path}`;
   const logger = getLogger();
   logger.api(url);
@@ -97,46 +101,62 @@ async function fetchJson<T>(path: string): Promise<T> {
       headers: { Accept: 'application/json' },
     });
     if (!res.ok) {
-      throw new Error(`fstats ${res.status}: ${res.statusText}`);
+      logger.warn('ANALYTICS', `fstats ${res.status}: ${res.statusText} for ${path}`);
+      return null;
     }
     const contentType = res.headers.get('content-type') ?? '';
     if (!contentType.includes('json')) {
-      throw new Error(`fstats returned non-JSON response: ${contentType}`);
+      logger.warn('ANALYTICS', `fstats returned non-JSON for ${path}: ${contentType}`);
+      return null;
     }
     return (await res.json()) as T;
+  } catch (error: unknown) {
+    logger.warn('ANALYTICS', `fstats fetch failed for ${path}: ${getErrorMessage(error)}`);
+    return null;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function fetchWithRetry<T>(path: string): Promise<T> {
-  return withRetry(() => fetchJson<T>(path), `fstats:${path}`);
+/**
+ * Safely extract an array from an API response.
+ * Handles cases where API returns an object with a data field, or a non-array.
+ */
+function safeArray<T>(raw: unknown): T[] {
+  if (Array.isArray(raw)) return raw as T[];
+  if (raw && typeof raw === 'object' && 'data' in raw) {
+    const inner = (raw as Record<string, unknown>).data;
+    if (Array.isArray(inner)) return inner as T[];
+  }
+  return [];
 }
 
 export class FStatsClient implements IDataClient {
   async getOverviewStats(period: '7d' | '30d' | 'all' = '30d'): Promise<OverviewStats> {
-    const raw = await fetchWithRetry<RawOverviewStats>(`/overview/stats?period=${period}`);
+    const raw = await safeFetchJson<RawOverviewStats>(`/overview/stats?period=${period}`);
     return {
-      volumeUsd: raw.volume_usd ?? 0,
-      volumeChangePct: raw.volume_change_pct ?? 0,
-      trades: raw.trades ?? 0,
-      tradesChangePct: raw.trades_change_pct ?? 0,
-      feesUsd: raw.fees_usd ?? 0,
-      poolPnlUsd: raw.pool_pnl_usd ?? 0,
-      poolRevenueUsd: raw.pool_revenue_usd ?? 0,
-      uniqueTraders: raw.unique_traders ?? 0,
+      volumeUsd: raw?.volume_usd ?? 0,
+      volumeChangePct: raw?.volume_change_pct ?? 0,
+      trades: raw?.trades ?? 0,
+      tradesChangePct: raw?.trades_change_pct ?? 0,
+      feesUsd: raw?.fees_usd ?? 0,
+      poolPnlUsd: raw?.pool_pnl_usd ?? 0,
+      poolRevenueUsd: raw?.pool_revenue_usd ?? 0,
+      uniqueTraders: raw?.unique_traders ?? 0,
     };
   }
 
   async getRecentActivity(limit = 20): Promise<RawOpenPosition[]> {
-    return fetchWithRetry<RawOpenPosition[]>(`/overview/activity?limit=${limit}`);
+    const raw = await safeFetchJson<unknown>(`/overview/activity?limit=${limit}`);
+    return safeArray<RawOpenPosition>(raw);
   }
 
   async getVolume(days = 30, pool?: string): Promise<VolumeData> {
     const poolParam = pool ? `&pool=${pool}` : '';
-    const daily = await fetchWithRetry<RawDailyVolume[]>(`/volume/daily?days=${days}${poolParam}`);
-    const dailyVolumes: DailyVolume[] = (daily ?? []).map((d) => ({
-      date: d.date,
+    const raw = await safeFetchJson<unknown>(`/volume/daily?days=${days}${poolParam}`);
+    const daily = safeArray<RawDailyVolume>(raw);
+    const dailyVolumes: DailyVolume[] = daily.map((d) => ({
+      date: d.date ?? '',
       volumeUsd: d.volume_usd ?? 0,
       trades: d.trades ?? 0,
       longVolume: d.long_volume ?? 0,
@@ -155,8 +175,9 @@ export class FStatsClient implements IDataClient {
   }
 
   async getOpenInterest(): Promise<OpenInterestData> {
-    const raw = await fetchWithRetry<RawMarketOI[]>('/positions/open-interest');
-    const markets: MarketOI[] = (raw ?? []).map((m) => ({
+    const raw = await safeFetchJson<unknown>('/positions/open-interest');
+    const entries = safeArray<RawMarketOI>(raw);
+    const markets: MarketOI[] = entries.map((m) => ({
       market: m.market_symbol ?? m.market ?? '',
       longOi: m.long_oi ?? m.long_open_interest ?? 0,
       shortOi: m.short_oi ?? m.short_open_interest ?? 0,
@@ -167,18 +188,19 @@ export class FStatsClient implements IDataClient {
   }
 
   async getOpenPositions(): Promise<RawOpenPosition[]> {
-    const raw = await fetchWithRetry<RawOpenPosition[] | Record<string, unknown>>('/positions/open');
-    return Array.isArray(raw) ? raw : [];
+    const raw = await safeFetchJson<unknown>('/positions/open');
+    return safeArray<RawOpenPosition>(raw);
   }
 
   async getFees(days = 30): Promise<FeeData> {
-    const daily = await fetchWithRetry<RawDailyFee[]>(`/fees/daily?days=${days}`);
-    const dailyFees = (daily ?? []).map((d) => ({
-      date: d.date,
+    const raw = await safeFetchJson<unknown>(`/fees/daily?days=${days}`);
+    const daily = safeArray<RawDailyFee>(raw);
+    const dailyFees = daily.map((d) => ({
+      date: d.date ?? '',
       totalFees: d.total_fees ?? 0,
     }));
     const totalFees = dailyFees.reduce((sum, d) => sum + d.totalFees, 0);
-    const lastEntry = daily?.[daily.length - 1];
+    const lastEntry = daily[daily.length - 1];
     return {
       period: `${days}d`,
       totalFees,
@@ -194,10 +216,11 @@ export class FStatsClient implements IDataClient {
     days = 30,
     limit = 10
   ): Promise<LeaderboardEntry[]> {
-    const raw = await fetchWithRetry<RawLeaderboardEntry[]>(
+    const raw = await safeFetchJson<unknown>(
       `/leaderboards/${metric}?days=${days}&limit=${limit}`
     );
-    return (raw ?? []).map((entry, i) => ({
+    const entries = safeArray<RawLeaderboardEntry>(raw);
+    return entries.map((entry, i) => ({
       rank: i + 1,
       address: entry.address ?? entry.owner ?? '',
       pnl: entry.pnl ?? entry.net_pnl ?? 0,
@@ -208,14 +231,14 @@ export class FStatsClient implements IDataClient {
   }
 
   async getTraderProfile(address: string): Promise<TraderProfile> {
-    const raw = await fetchWithRetry<RawTraderProfile>(`/traders/${address}`);
+    const raw = await safeFetchJson<RawTraderProfile>(`/traders/${address}`);
     return {
-      address: raw.address ?? address,
-      totalTrades: raw.total_trades ?? 0,
-      totalVolume: raw.total_volume ?? 0,
-      totalPnl: raw.total_pnl ?? raw.net_pnl ?? 0,
-      winRate: raw.win_rate ?? 0,
-      markets: raw.markets ?? {},
+      address: raw?.address ?? address,
+      totalTrades: raw?.total_trades ?? 0,
+      totalVolume: raw?.total_volume ?? 0,
+      totalPnl: raw?.total_pnl ?? raw?.net_pnl ?? 0,
+      winRate: raw?.win_rate ?? 0,
+      markets: raw?.markets ?? {},
     };
   }
 }

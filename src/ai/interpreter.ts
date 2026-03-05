@@ -244,7 +244,13 @@ export class AIInterpreter {
       logger.debug('AI', 'Claude parsed intent', { action: validated.action });
       return validated;
     } catch (error: unknown) {
-      logger.error('AI', `Parse failed: ${getErrorMessage(error)}`);
+      const msg = getErrorMessage(error);
+      // Graceful fallback on API errors (billing, network, auth)
+      if (msg.includes('credit balance') || msg.includes('401') || msg.includes('403') || msg.includes('429')) {
+        logger.warn('AI', `Claude API unavailable (${msg}). Using local parsing only.`);
+      } else {
+        logger.error('AI', `Parse failed: ${msg}`);
+      }
       return { action: ActionType.Help };
     }
   }

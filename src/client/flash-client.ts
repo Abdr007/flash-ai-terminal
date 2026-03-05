@@ -30,10 +30,90 @@ import {
   ClosePositionResult,
   CollateralResult,
 } from '../types/index.js';
-import { PriceService, TokenPrice } from '../data/prices.js';
+import { OraclePrice } from 'flash-sdk';
+import { PythHttpClient, getPythProgramKeyForCluster, PriceData } from '@pythnetwork/client';
 import { getPoolForMarket } from '../config/index.js';
 import { getLogger } from '../utils/logger.js';
-import { getErrorMessage } from '../utils/retry.js';
+import { getErrorMessage, withRetry } from '../utils/retry.js';
+
+/** Pyth-based price data used by the live client for SDK interactions */
+interface LiveTokenPrice {
+  price: OraclePrice;
+  emaPrice: OraclePrice;
+  uiPrice: number;
+  timestamp: number;
+}
+
+/** Pyth price service used only by the live FlashClient */
+class PythPriceService {
+  private pythClient: PythHttpClient;
+  private cache: Map<string, { data: LiveTokenPrice; expiry: number }> = new Map();
+  private cacheTtlMs = 5_000;
+
+  constructor(pythnetUrl: string) {
+    const conn = new Connection(pythnetUrl);
+    this.pythClient = new PythHttpClient(conn, getPythProgramKeyForCluster('pythnet'));
+  }
+
+  async getPrices(tokens: { symbol: string; pythTicker: string }[]): Promise<Map<string, LiveTokenPrice>> {
+    const priceMap = new Map<string, LiveTokenPrice>();
+    const now = Date.now();
+    const logger = getLogger();
+    const uncached: typeof tokens = [];
+
+    for (const token of tokens) {
+      const cached = this.cache.get(token.symbol);
+      if (cached && cached.expiry > now) {
+        priceMap.set(token.symbol, cached.data);
+      } else {
+        uncached.push(token);
+      }
+    }
+
+    if (uncached.length === 0) return priceMap;
+
+    const pythData = await withRetry(() => this.pythClient.getData(), 'pyth-prices', { maxAttempts: 2 });
+
+    for (const token of uncached) {
+      const priceData: PriceData | undefined = pythData.productPrice.get(token.pythTicker);
+      if (!priceData) {
+        logger.warn('PRICE', `No Pyth data for ${token.symbol} (${token.pythTicker})`);
+        continue;
+      }
+
+      const priceComponent = priceData.aggregate.priceComponent;
+      const emaPriceComponent = priceData.emaPrice.valueComponent;
+      const confidence = priceData.confidence ?? 0;
+      const emaConfidence = priceData.emaConfidence?.valueComponent ?? 0;
+
+      const price = new OraclePrice({
+        price: new BN(priceComponent.toString()),
+        exponent: new BN(priceData.exponent),
+        confidence: new BN(confidence.toString()),
+        timestamp: new BN(priceData.timestamp.toString()),
+      });
+
+      const emaPrice = new OraclePrice({
+        price: new BN(emaPriceComponent.toString()),
+        exponent: new BN(priceData.exponent),
+        confidence: new BN(emaConfidence.toString()),
+        timestamp: new BN(priceData.timestamp.toString()),
+      });
+
+      const tokenPrice: LiveTokenPrice = {
+        price,
+        emaPrice,
+        uiPrice: priceData.aggregate.price ?? 0,
+        timestamp: priceData.timestamp ? Number(priceData.timestamp) * 1000 : now,
+      };
+
+      priceMap.set(token.symbol, tokenPrice);
+      this.cache.set(token.symbol, { data: tokenPrice, expiry: now + this.cacheTtlMs });
+    }
+
+    return priceMap;
+  }
+}
 
 function toSdkSide(side: TradeSide): typeof Side.Long | typeof Side.Short {
   return side === TradeSide.Long ? Side.Long : Side.Short;
@@ -45,7 +125,7 @@ export class FlashClient implements IFlashClient {
   private provider: AnchorProvider;
   private perpClient: PerpetualsClient;
   private poolConfig: PoolConfig;
-  private priceService: PriceService;
+  private priceService: PythPriceService;
   private config: FlashConfig;
   private altCache: AddressLookupTableAccount[] | null = null;
   private solBalance = 0;
@@ -99,7 +179,7 @@ export class FlashClient implements IFlashClient {
       { prioritizationFee: 0 }
     );
 
-    this.priceService = new PriceService(config.pythnetUrl);
+    this.priceService = new PythPriceService(config.pythnetUrl);
   }
 
   get walletAddress(): string {
@@ -119,7 +199,7 @@ export class FlashClient implements IFlashClient {
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
-  private async getPriceMap(poolConfig: PoolConfig): Promise<Map<string, TokenPrice>> {
+  private async getPriceMap(poolConfig: PoolConfig): Promise<Map<string, LiveTokenPrice>> {
     const tokens = (poolConfig.tokens as Array<{ symbol: string; pythTicker: string }>).map((t) => ({
       symbol: t.symbol,
       pythTicker: t.pythTicker,

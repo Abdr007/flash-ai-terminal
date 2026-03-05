@@ -346,34 +346,42 @@ export const flashGetVolume: ToolDefinition = {
     period: z.enum(['7d', '30d', 'all']).optional(),
   }),
   execute: async (params, context): Promise<ToolResult> => {
-    const { period } = params as { period?: '7d' | '30d' | 'all' };
-    const days = period === '7d' ? 7 : period === 'all' ? 365 : 30;
-    const volume = await context.dataClient.getVolume(days);
+    try {
+      const { period } = params as { period?: '7d' | '30d' | 'all' };
+      const days = period === '7d' ? 7 : period === 'all' ? 365 : 30;
+      const volume = await context.dataClient.getVolume(days);
 
-    const recent = volume.dailyVolumes.slice(-7);
-    const headers = ['Date', 'Volume', 'Trades', 'Long', 'Short'];
-    const rows = recent.map((d: DailyVolume) => [
-      d.date,
-      formatUsd(d.volumeUsd),
-      d.trades.toString(),
-      formatUsd(d.longVolume),
-      formatUsd(d.shortVolume),
-    ]);
+      const recent = volume.dailyVolumes.slice(-7);
+      if (recent.length === 0) {
+        return { success: true, message: chalk.dim('  No volume data available. Try again later.') };
+      }
 
-    return {
-      success: true,
-      message: [
-        '',
-        chalk.bold(`  Volume (${volume.period})`),
-        chalk.dim('  ─────────────────────'),
-        `  Total: ${formatUsd(volume.totalVolumeUsd)}`,
-        `  Trades: ${volume.trades.toLocaleString()}`,
-        '',
-        formatTable(headers, rows),
-        '',
-      ].join('\n'),
-      data: { volume },
-    };
+      const headers = ['Date', 'Volume', 'Trades', 'Long', 'Short'];
+      const rows = recent.map((d: DailyVolume) => [
+        d.date,
+        formatUsd(d.volumeUsd),
+        d.trades.toString(),
+        formatUsd(d.longVolume),
+        formatUsd(d.shortVolume),
+      ]);
+
+      return {
+        success: true,
+        message: [
+          '',
+          chalk.bold(`  Volume (${volume.period})`),
+          chalk.dim('  ─────────────────────'),
+          `  Total: ${formatUsd(volume.totalVolumeUsd)}`,
+          `  Trades: ${volume.trades.toLocaleString()}`,
+          '',
+          formatTable(headers, rows),
+          '',
+        ].join('\n'),
+        data: { volume },
+      };
+    } catch (error: unknown) {
+      return { success: false, message: chalk.red(`  Unable to fetch volume data. Try again later. (${getErrorMessage(error)})`) };
+    }
   },
 };
 
@@ -382,26 +390,30 @@ export const flashGetOpenInterest: ToolDefinition = {
   description: 'Get open interest data',
   parameters: z.object({}),
   execute: async (_params, context): Promise<ToolResult> => {
-    const oi = await context.dataClient.getOpenInterest();
+    try {
+      const oi = await context.dataClient.getOpenInterest();
 
-    if (oi.markets.length === 0) {
-      return { success: true, message: chalk.dim('  No OI data available') };
+      if (oi.markets.length === 0) {
+        return { success: true, message: chalk.dim('  No OI data available') };
+      }
+
+      const headers = ['Market', 'Long OI', 'Short OI', 'L Positions', 'S Positions'];
+      const rows = oi.markets.map((m: MarketOI) => [
+        chalk.bold(m.market),
+        formatUsd(m.longOi),
+        formatUsd(m.shortOi),
+        m.longPositions.toString(),
+        m.shortPositions.toString(),
+      ]);
+
+      return {
+        success: true,
+        message: '\n' + formatTable(headers, rows) + '\n',
+        data: { openInterest: oi },
+      };
+    } catch (error: unknown) {
+      return { success: false, message: chalk.red(`  Unable to fetch open interest data. Try again later. (${getErrorMessage(error)})`) };
     }
-
-    const headers = ['Market', 'Long OI', 'Short OI', 'L Positions', 'S Positions'];
-    const rows = oi.markets.map((m: MarketOI) => [
-      chalk.bold(m.market),
-      formatUsd(m.longOi),
-      formatUsd(m.shortOi),
-      m.longPositions.toString(),
-      m.shortPositions.toString(),
-    ]);
-
-    return {
-      success: true,
-      message: '\n' + formatTable(headers, rows) + '\n',
-      data: { openInterest: oi },
-    };
   },
 };
 
@@ -414,38 +426,46 @@ export const flashGetLeaderboard: ToolDefinition = {
     limit: z.number().optional(),
   }),
   execute: async (params, context): Promise<ToolResult> => {
-    const { metric: rawMetric, period, limit: rawLimit } = params as {
-      metric?: 'pnl' | 'volume';
-      period?: number;
-      limit?: number;
-    };
-    const metric = rawMetric ?? 'pnl';
-    const days = period ?? 30;
-    const limit = rawLimit ?? 10;
+    try {
+      const { metric: rawMetric, period, limit: rawLimit } = params as {
+        metric?: 'pnl' | 'volume';
+        period?: number;
+        limit?: number;
+      };
+      const metric = rawMetric ?? 'pnl';
+      const days = period ?? 30;
+      const limit = rawLimit ?? 10;
 
-    const entries = await context.dataClient.getLeaderboard(metric, days, limit);
+      const entries = await context.dataClient.getLeaderboard(metric, days, limit);
 
-    const headers = ['#', 'Trader', 'PnL', 'Volume', 'Trades', 'Win Rate'];
-    const rows = entries.map((e: LeaderboardEntry) => [
-      `${e.rank}`,
-      shortAddress(e.address),
-      colorPnl(e.pnl),
-      formatUsd(e.volume),
-      e.trades.toString(),
-      `${(e.winRate * 100).toFixed(0)}%`,
-    ]);
+      if (entries.length === 0) {
+        return { success: true, message: chalk.dim('  No leaderboard data available. Try again later.') };
+      }
 
-    return {
-      success: true,
-      message: [
-        '',
-        chalk.bold(`  Leaderboard — ${metric.toUpperCase()} (${days}d)`),
-        '',
-        formatTable(headers, rows),
-        '',
-      ].join('\n'),
-      data: { leaderboard: entries },
-    };
+      const headers = ['#', 'Trader', 'PnL', 'Volume', 'Trades', 'Win Rate'];
+      const rows = entries.map((e: LeaderboardEntry) => [
+        `${e.rank}`,
+        shortAddress(e.address),
+        colorPnl(e.pnl),
+        formatUsd(e.volume),
+        e.trades.toString(),
+        `${(e.winRate * 100).toFixed(0)}%`,
+      ]);
+
+      return {
+        success: true,
+        message: [
+          '',
+          chalk.bold(`  Leaderboard — ${metric.toUpperCase()} (${days}d)`),
+          '',
+          formatTable(headers, rows),
+          '',
+        ].join('\n'),
+        data: { leaderboard: entries },
+      };
+    } catch (error: unknown) {
+      return { success: false, message: chalk.red(`  Unable to fetch leaderboard. Try again later. (${getErrorMessage(error)})`) };
+    }
   },
 };
 
@@ -456,21 +476,25 @@ export const flashGetFees: ToolDefinition = {
     period: z.number().optional(),
   }),
   execute: async (params, context): Promise<ToolResult> => {
-    const { period } = params as { period?: number };
-    const days = period ?? 30;
-    const fees = await context.dataClient.getFees(days);
+    try {
+      const { period } = params as { period?: number };
+      const days = period ?? 30;
+      const fees = await context.dataClient.getFees(days);
 
-    return {
-      success: true,
-      message: [
-        '',
-        chalk.bold(`  Fees (${fees.period})`),
-        chalk.dim('  ─────────────────'),
-        `  Total Fees: ${formatUsd(fees.totalFees)}`,
-        '',
-      ].join('\n'),
-      data: { fees },
-    };
+      return {
+        success: true,
+        message: [
+          '',
+          chalk.bold(`  Fees (${fees.period})`),
+          chalk.dim('  ─────────────────'),
+          `  Total Fees: ${formatUsd(fees.totalFees)}`,
+          '',
+        ].join('\n'),
+        data: { fees },
+      };
+    } catch (error: unknown) {
+      return { success: false, message: chalk.red(`  Unable to fetch fee data. Try again later. (${getErrorMessage(error)})`) };
+    }
   },
 };
 
