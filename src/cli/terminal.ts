@@ -1,6 +1,5 @@
 import { createInterface, Interface } from 'readline';
 import chalk from 'chalk';
-import ora from 'ora';
 import { AIInterpreter, OfflineInterpreter } from '../ai/interpreter.js';
 import { ToolEngine } from '../tools/engine.js';
 import { ToolContext, ToolResult, FlashConfig, IFlashClient } from '../types/index.js';
@@ -18,7 +17,6 @@ export class FlashTerminal {
   private rl!: Interface;
   private flashClient!: IFlashClient;
   private fstats: FStatsClient;
-  private running = false;
 
   constructor(config: FlashConfig) {
     this.config = config;
@@ -59,16 +57,6 @@ export class FlashTerminal {
       output: process.stdout,
     });
 
-    // Graceful shutdown
-    const shutdown = () => {
-      console.log(chalk.dim('\n  Goodbye.\n'));
-      this.running = false;
-      this.rl.close();
-      process.exit(0);
-    };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
-
     // Print banner
     console.log(banner());
 
@@ -85,63 +73,56 @@ export class FlashTerminal {
 
     console.log(chalk.dim('\n  Type "help" for commands, "exit" to quit.\n'));
 
-    // Main loop
-    this.running = true;
-    while (this.running) {
-      const input = await this.prompt();
-      if (input === null) break;
-
-      const trimmed = input.trim();
-      if (!trimmed) continue;
-
-      if (trimmed.toLowerCase() === 'exit' || trimmed.toLowerCase() === 'quit') {
-        shutdown();
-        return;
-      }
-
-      await this.handleInput(trimmed);
-    }
+    // Start the prompt loop
+    this.promptLoop();
   }
 
-  private prompt(): Promise<string | null> {
+  private promptLoop(): void {
     const prefix = this.config.simulationMode
       ? chalk.yellow('flash [sim]')
       : chalk.green('flash');
 
-    return new Promise((resolve) => {
-      this.rl.question(`${prefix} > `, (answer) => resolve(answer));
-      this.rl.once('close', () => resolve(null));
+    this.rl.question(`${prefix} > `, async (input) => {
+      const trimmed = input.trim();
+
+      if (!trimmed) {
+        this.promptLoop();
+        return;
+      }
+
+      if (trimmed.toLowerCase() === 'exit' || trimmed.toLowerCase() === 'quit') {
+        console.log(chalk.dim('\n  Goodbye.\n'));
+        this.rl.close();
+        process.exit(0);
+      }
+
+      await this.handleInput(trimmed);
+      this.promptLoop();
     });
   }
 
   private async handleInput(input: string): Promise<void> {
     // Parse intent
-    const spinner = ora({
-      text: chalk.dim('Parsing...'),
-      spinner: 'dots',
-    }).start();
+    process.stdout.write(chalk.dim('  Parsing...\r'));
 
     let intent;
     try {
       intent = await this.interpreter.parseIntent(input);
-      spinner.stop();
+      process.stdout.write('              \r');
     } catch (error: unknown) {
-      spinner.fail(chalk.red(`Parse error: ${getErrorMessage(error)}`));
+      console.log(chalk.red(`  Parse error: ${getErrorMessage(error)}`));
       return;
     }
 
     // Execute tool
-    const execSpinner = ora({
-      text: chalk.dim('Executing...'),
-      spinner: 'dots',
-    }).start();
+    process.stdout.write(chalk.dim('  Executing...\r'));
 
     let result: ToolResult;
     try {
       result = await this.engine.dispatch(intent);
-      execSpinner.stop();
+      process.stdout.write('               \r');
     } catch (error: unknown) {
-      execSpinner.fail(chalk.red(`Execution error: ${getErrorMessage(error)}`));
+      console.log(chalk.red(`  Execution error: ${getErrorMessage(error)}`));
       return;
     }
 
@@ -152,17 +133,14 @@ export class FlashTerminal {
     if (result.requiresConfirmation && result.data?.executeAction) {
       const confirmed = await this.confirm(result.confirmationPrompt ?? 'Confirm?');
       if (confirmed) {
-        const confirmSpinner = ora({
-          text: chalk.dim('Submitting...'),
-          spinner: 'dots',
-        }).start();
+        process.stdout.write(chalk.dim('  Submitting...\r'));
 
         try {
           const execResult = await result.data.executeAction();
-          confirmSpinner.stop();
+          process.stdout.write('                \r');
           console.log(execResult.message);
         } catch (error: unknown) {
-          confirmSpinner.fail(chalk.red(`Transaction failed: ${getErrorMessage(error)}`));
+          console.log(chalk.red(`  Transaction failed: ${getErrorMessage(error)}`));
         }
       } else {
         console.log(chalk.dim('  Cancelled.'));
