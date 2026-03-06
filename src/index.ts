@@ -6,10 +6,21 @@ import { FlashTerminal } from './cli/terminal.js';
 import { getErrorMessage } from './utils/retry.js';
 import chalk from 'chalk';
 
-// Global error handlers
+// Global error handlers — prevent crashes from leaking to the user
 process.on('unhandledRejection', (reason) => {
   console.error(chalk.red(`\n  Unhandled error: ${getErrorMessage(reason)}\n`));
   process.exit(1);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error(chalk.red(`\n  Fatal error: ${getErrorMessage(err)}\n`));
+  process.exit(1);
+});
+
+// Graceful shutdown on SIGTERM (e.g., Docker, system shutdown)
+process.on('SIGTERM', () => {
+  console.log(chalk.dim('\n  Received SIGTERM, shutting down...\n'));
+  process.exit(0);
 });
 
 const program = new Command();

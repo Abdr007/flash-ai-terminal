@@ -108,6 +108,8 @@ export class MarketScanner {
   private regimeDetector: RegimeDetector;
   private cachedResults: Opportunity[] | null = null;
   private cacheExpiry = 0;
+  /** Mutex: prevents overlapping concurrent scans from wasting RPC quota */
+  private scanInProgress: Promise<Opportunity[]> | null = null;
 
   constructor(inspector: SolanaInspector) {
     this.inspector = inspector;
@@ -117,6 +119,7 @@ export class MarketScanner {
   /**
    * Scan all markets and return ranked opportunities.
    * Results are cached for 30 seconds to avoid redundant RPC calls.
+   * Concurrent calls share the same in-flight promise (scan mutex).
    */
   async scan(balance: number, topN = 10): Promise<Opportunity[]> {
     const now = Date.now();
@@ -124,8 +127,22 @@ export class MarketScanner {
       return this.cachedResults;
     }
 
+    // If a scan is already in progress, wait for it instead of starting a new one
+    if (this.scanInProgress) {
+      return this.scanInProgress;
+    }
+
+    this.scanInProgress = this.doScan(balance, topN);
+    try {
+      return await this.scanInProgress;
+    } finally {
+      this.scanInProgress = null;
+    }
+  }
+
+  private async doScan(balance: number, topN: number): Promise<Opportunity[]> {
     const logger = getLogger();
-    const startTime = now;
+    const startTime = Date.now();
 
     // Fetch all data in parallel (leverages SolanaInspector's internal caches)
     const [markets, volume, openInterest, recentActivity, openPositions] = await Promise.all([

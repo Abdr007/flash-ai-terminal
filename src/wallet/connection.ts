@@ -1,7 +1,10 @@
 import { Connection, type Commitment } from '@solana/web3.js';
 
-/** RPC timeout for all Solana calls (5 seconds). */
-const RPC_TIMEOUT_MS = 5_000;
+/** RPC timeout for regular queries (120s — must exceed confirm timeout to avoid killing confirmTransaction). */
+const RPC_FETCH_TIMEOUT_MS = 120_000;
+
+/** Timeout for transaction confirmation (90s — blockhash validity window). */
+const TX_CONFIRM_TIMEOUT_MS = 90_000;
 
 /**
  * Validate an RPC URL: must be well-formed HTTPS (or localhost for development).
@@ -31,15 +34,29 @@ function validateRpcUrl(url: string): void {
   }
 }
 
+/**
+ * Derive WebSocket endpoint from RPC URL using proper URL parsing.
+ * Only replaces the protocol — preserves path, query params, and fragment.
+ */
+function deriveWsEndpoint(rpcUrl: string): string {
+  const parsed = new URL(rpcUrl);
+  parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+  return parsed.toString();
+}
+
 export function createConnection(
   rpcUrl: string,
   config?: { commitment?: Commitment }
 ): Connection {
   validateRpcUrl(rpcUrl);
+
+  const wsEndpoint = deriveWsEndpoint(rpcUrl);
+
   return new Connection(rpcUrl, {
-    commitment: config?.commitment ?? 'processed',
-    confirmTransactionInitialTimeout: RPC_TIMEOUT_MS,
+    commitment: config?.commitment ?? 'confirmed',
+    confirmTransactionInitialTimeout: TX_CONFIRM_TIMEOUT_MS,
+    wsEndpoint,
     fetch: (url, options) =>
-      fetch(url, { ...options, signal: AbortSignal.timeout(RPC_TIMEOUT_MS) }),
+      fetch(url, { ...options, signal: AbortSignal.timeout(RPC_FETCH_TIMEOUT_MS) }),
   });
 }

@@ -94,11 +94,12 @@ export function filterOpportunities(
   let shortExposure = 0;
 
   for (const pos of positions) {
+    if (!pos.market || !Number.isFinite(pos.sizeUsd)) continue;
     const key = pos.market.toUpperCase();
     exposureByMarket[key] = (exposureByMarket[key] ?? 0) + pos.sizeUsd;
     if (pos.side === TradeSide.Long) {
       longExposure += pos.sizeUsd;
-    } else {
+    } else if (pos.side === TradeSide.Short) {
       shortExposure += pos.sizeUsd;
     }
   }

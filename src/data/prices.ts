@@ -35,6 +35,7 @@ const COINGECKO_IDS: Record<string, string> = {
 // excluded from analysis. Trading decisions must NEVER rely on stale prices.
 
 const FETCH_TIMEOUT_MS = 8_000;
+const MAX_PRICE_CACHE_ENTRIES = 100;
 
 export class PriceService {
   private cache: Map<string, { data: TokenPrice; expiry: number }> = new Map();
@@ -62,6 +63,17 @@ export class PriceService {
     }
 
     if (uncached.length === 0) return priceMap;
+
+    // Evict expired/excess entries before inserting new ones
+    if (this.cache.size >= MAX_PRICE_CACHE_ENTRIES) {
+      for (const [k, entry] of this.cache) {
+        if (entry.expiry <= now) this.cache.delete(k);
+      }
+      if (this.cache.size >= MAX_PRICE_CACHE_ENTRIES) {
+        const oldest = Array.from(this.cache.keys()).slice(0, 10);
+        for (const k of oldest) this.cache.delete(k);
+      }
+    }
 
     // Try CoinGecko API
     try {

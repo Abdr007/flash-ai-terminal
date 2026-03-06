@@ -109,9 +109,17 @@ export class RegimeDetector {
     };
 
     // Cache with eviction
-    if (this.cache.size >= RegimeDetector.MAX_CACHE) {
+    if (this.cache.size > RegimeDetector.MAX_CACHE) {
       for (const [k, entry] of this.cache) {
         if (entry.expiry <= now) this.cache.delete(k);
+      }
+      // If still over capacity, remove oldest entries
+      if (this.cache.size > RegimeDetector.MAX_CACHE) {
+        const toRemove = this.cache.size - RegimeDetector.MAX_CACHE;
+        const keys = Array.from(this.cache.keys());
+        for (let i = 0; i < toRemove; i++) {
+          this.cache.delete(keys[i]);
+        }
       }
     }
     this.cache.set(key, { state, expiry: now + RegimeDetector.CACHE_TTL });

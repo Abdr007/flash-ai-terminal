@@ -48,9 +48,10 @@ export function analyzeRebalance(
   const marketExposure = new Map<string, number>();
 
   for (const pos of positions) {
+    if (!pos.market || !Number.isFinite(pos.sizeUsd)) continue;
     if (pos.side === TradeSide.Long) {
       longExposure += pos.sizeUsd;
-    } else {
+    } else if (pos.side === TradeSide.Short) {
       shortExposure += pos.sizeUsd;
     }
     const current = marketExposure.get(pos.market) ?? 0;
@@ -129,8 +130,10 @@ export function analyzeRebalance(
 
   // 3. Directional bias label
   let directionalBias: string;
-  if (longPct > 60) directionalBias = `${(longPct / (shortPct || 1)).toFixed(1)}:1 Long`;
-  else if (shortPct > 60) directionalBias = `${(shortPct / (longPct || 1)).toFixed(1)}:1 Short`;
+  if (longPct > 60 && shortPct > 0) directionalBias = `${(longPct / shortPct).toFixed(1)}:1 Long`;
+  else if (longPct > 60) directionalBias = 'Long Only';
+  else if (shortPct > 60 && longPct > 0) directionalBias = `${(shortPct / longPct).toFixed(1)}:1 Short`;
+  else if (shortPct > 60) directionalBias = 'Short Only';
   else directionalBias = 'Balanced';
 
   return {

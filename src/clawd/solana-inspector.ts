@@ -52,15 +52,16 @@ export class SolanaInspector {
 
   private setCache<T>(key: string, data: T, ttl: number): void {
     // Evict expired entries if cache grows too large
-    if (this.cache.size >= MAX_CACHE_ENTRIES) {
+    if (this.cache.size > MAX_CACHE_ENTRIES) {
       const now = Date.now();
       for (const [k, entry] of this.cache) {
         if (entry.expiry <= now) this.cache.delete(k);
       }
       // If still too large after eviction, remove oldest entries
-      if (this.cache.size >= MAX_CACHE_ENTRIES) {
+      if (this.cache.size > MAX_CACHE_ENTRIES) {
+        const toRemove = this.cache.size - MAX_CACHE_ENTRIES;
         const keys = Array.from(this.cache.keys());
-        for (let i = 0; i < keys.length - MAX_CACHE_ENTRIES + 1; i++) {
+        for (let i = 0; i < toRemove; i++) {
           this.cache.delete(keys[i]);
         }
       }

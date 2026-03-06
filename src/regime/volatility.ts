@@ -22,6 +22,10 @@ export interface VolatilityResult {
 /**
  * Compute volatility from price series using standard deviation of returns.
  *
+ * NOTE: Currently unused in active code paths. The regime detector uses
+ * estimateVolatilityFromChange() instead since only 24h change data is available.
+ * Retained for future use when full price history becomes available.
+ *
  * Steps:
  * 1. Compute returns: (price[t] - price[t-1]) / price[t-1]
  * 2. Compute standard deviation of returns
@@ -31,21 +35,22 @@ export interface VolatilityResult {
  *   > 0.7 → HIGH_VOLATILITY
  *   < 0.3 → LOW_VOLATILITY
  *
- * If fewer than 2 prices, returns neutral (0.5).
+ * If fewer than 2 valid prices, returns neutral (0.5).
  */
 export function computeVolatility(input: VolatilityInput): VolatilityResult {
   const { prices, threshold = 0.03 } = input;
 
-  if (prices.length < 2) {
+  // Filter to only valid finite prices
+  const validPrices = prices.filter((p) => Number.isFinite(p) && p > 0);
+
+  if (validPrices.length < 2) {
     return { stddev: 0, volatility: 0.5, isHighVolatility: false, isLowVolatility: false };
   }
 
   // Compute returns
   const returns: number[] = [];
-  for (let i = 1; i < prices.length; i++) {
-    if (prices[i - 1] > 0) {
-      returns.push((prices[i] - prices[i - 1]) / prices[i - 1]);
-    }
+  for (let i = 1; i < validPrices.length; i++) {
+    returns.push((validPrices[i] - validPrices[i - 1]) / validPrices[i - 1]);
   }
 
   if (returns.length === 0) {

@@ -28,9 +28,11 @@ export async function withRetry<T>(
     } catch (err: unknown) {
       lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt < maxAttempts) {
+        // Exponential backoff with jitter, clamped to maxDelayMs
+        const exponential = baseDelayMs * 2 ** (attempt - 1);
         const jitter = Math.random() * baseDelayMs * 0.5;
-        const delay = Math.min(baseDelayMs * 2 ** (attempt - 1) + jitter, maxDelayMs);
-        logger.warn('RETRY', `${label} failed (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms`, {
+        const delay = Math.min(exponential + jitter, maxDelayMs);
+        logger.warn('RETRY', `${label} failed (attempt ${attempt}/${maxAttempts}), retrying in ${Math.round(delay)}ms`, {
           error: lastError.message,
         });
         await new Promise((resolve) => setTimeout(resolve, delay));

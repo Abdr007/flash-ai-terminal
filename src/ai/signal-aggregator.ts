@@ -119,7 +119,8 @@ export function aggregateSignals(
   else if (confidenceScore >= 0.4) recommendedLeverage = 2;
   else recommendedLeverage = 1.5;
 
-  recommendedLeverage = Math.max(1.1, recommendedLeverage * w.leverageMultiplier);
+  const leverageProduct = recommendedLeverage * safeWeight(w.leverageMultiplier, 1.0);
+  recommendedLeverage = Math.max(1.1, Number.isFinite(leverageProduct) ? leverageProduct : recommendedLeverage);
 
   return {
     market: market.symbol,

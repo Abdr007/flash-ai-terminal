@@ -50,10 +50,10 @@ export function loadConfig(): FlashConfig {
     groqApiKey: process.env.GROQ_API_KEY || '',
     defaultPool: process.env.DEFAULT_POOL || 'Crypto.1',
     network: parseNetwork(process.env.NETWORK),
-    simulationMode: process.env.SIMULATION_MODE !== 'false',
+    simulationMode: (process.env.SIMULATION_MODE ?? 'true').toLowerCase() !== 'false',
     defaultSlippageBps: parseIntSafe(process.env.DEFAULT_SLIPPAGE_BPS, 150),
     computeUnitLimit: parseIntSafe(process.env.COMPUTE_UNIT_LIMIT, 600000),
-    computeUnitPrice: parseIntSafe(process.env.COMPUTE_UNIT_PRICE, 50000),
+    computeUnitPrice: parseIntSafe(process.env.COMPUTE_UNIT_PRICE, 500000),
     logFile: process.env.LOG_FILE || null,
   };
 }

@@ -594,7 +594,7 @@ export const flashGetLeaderboard: ToolDefinition = {
         colorPnl(e.pnl),
         formatUsd(e.volume),
         e.trades.toString(),
-        `${(e.winRate * 100).toFixed(0)}%`,
+        `${e.winRate.toFixed(0)}%`,
       ]);
 
       return {
@@ -662,7 +662,7 @@ export const flashGetTraderProfile: ToolDefinition = {
         `  Total Trades: ${profile.totalTrades}`,
         `  Total Volume: ${formatUsd(profile.totalVolume)}`,
         `  Total PnL:    ${colorPnl(profile.totalPnl)}`,
-        `  Win Rate:     ${(profile.winRate * 100).toFixed(1)}%`,
+        `  Win Rate:     ${profile.winRate.toFixed(1)}%`,
         '',
       ].join('\n'),
       data: { traderProfile: profile },

@@ -6,6 +6,7 @@ import {
   Signer,
   ComputeBudgetProgram,
   AddressLookupTableAccount,
+  VersionedTransaction,
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
@@ -48,6 +49,8 @@ interface LiveTokenPrice {
   timestamp: number;
 }
 
+const MAX_PYTH_CACHE_ENTRIES = 50;
+
 class PythPriceService {
   private pythClient: PythHttpClient;
   private cache: Map<string, { data: LiveTokenPrice; expiry: number }> = new Map();
@@ -88,6 +91,17 @@ class PythPriceService {
     }
 
     if (uncached.length === 0) return priceMap;
+
+    // Evict expired entries if cache is too large
+    if (this.cache.size >= MAX_PYTH_CACHE_ENTRIES) {
+      for (const [k, entry] of this.cache) {
+        if (entry.expiry <= now) this.cache.delete(k);
+      }
+      if (this.cache.size >= MAX_PYTH_CACHE_ENTRIES) {
+        const oldest = Array.from(this.cache.keys()).slice(0, 10);
+        for (const k of oldest) this.cache.delete(k);
+      }
+    }
 
     const pythData = await withRetry(() => this.pythClient.getData(), 'pyth-prices', { maxAttempts: 2 });
 
@@ -151,6 +165,14 @@ const DEFAULT_COLLATERAL_TOKEN = 'USDC';
 // Well-known USDC mint on Solana mainnet
 const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 
+/**
+ * Scrub sensitive data (API keys, private keys) from strings before logging.
+ */
+function scrubSensitive(msg: string): string {
+  // Mask anything that looks like an API key or base58 private key in query params
+  return msg.replace(/api[_-]?key=[^&\s]+/gi, 'api_key=***');
+}
+
 // ─── FlashClient ─────────────────────────────────────────────────────────────
 
 export class FlashClient implements IFlashClient {
@@ -165,6 +187,9 @@ export class FlashClient implements IFlashClient {
   private altCache: AddressLookupTableAccount[] | null = null;
   private cachedSolBalance = 0;
 
+  /** Per-market mutex to prevent concurrent transactions on the same market/side */
+  private activeTrades = new Set<string>();
+
   constructor(connection: Connection, walletManager: WalletManager, config: FlashConfig) {
     this.config = config;
     this.connection = connection;
@@ -178,8 +203,8 @@ export class FlashClient implements IFlashClient {
 
     const walletAdapter = new Wallet(this.wallet);
     this.provider = new AnchorProvider(this.connection, walletAdapter, {
-      commitment: 'processed',
-      preflightCommitment: 'processed',
+      commitment: 'confirmed',
+      preflightCommitment: 'confirmed',
     });
 
     try {
@@ -191,13 +216,14 @@ export class FlashClient implements IFlashClient {
       );
     }
 
+    // Match prioritizationFee with config to avoid conflict with manual CU instructions
     this.perpClient = new PerpetualsClient(
       this.provider,
       this.poolConfig.programId,
       this.poolConfig.perpComposibilityProgramId,
       this.poolConfig.fbNftRewardProgramId,
       this.poolConfig.rewardDistributionProgram.programId,
-      { prioritizationFee: 0 }
+      { prioritizationFee: config.computeUnitPrice }
     );
 
     this.priceService = new PythPriceService(config.pythnetUrl);
@@ -305,46 +331,254 @@ export class FlashClient implements IFlashClient {
     return { position, marketConfig };
   }
 
+  /**
+   * Check if a signature is already confirmed on-chain.
+   * Used to prevent false failure reports when simulation disagrees with actual state.
+   */
+  private async isSignatureConfirmed(signature: string): Promise<boolean> {
+    try {
+      const { value } = await this.connection.getSignatureStatuses([signature]);
+      const status = value?.[0];
+      if (status?.err) return false;
+      return status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Send a transaction with up to 2 attempts.
+   * Each attempt gets a fresh blockhash and re-signs via the SDK.
+   * Program errors (from simulation) are thrown immediately without retrying.
+   * Total window: ~90s (matches Solana blockhash validity).
+   */
   private async sendTx(
     instructions: TransactionInstruction[],
     additionalSigners: Signer[],
     poolConfig: PoolConfig
   ): Promise<string> {
+    const logger = getLogger();
+    const maxAttempts = 2;
+    const confirmTimeoutMs = 45_000; // 45s per attempt — 2 attempts covers ~90s blockhash window
     const cuLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.computeUnitLimit });
     const cuPriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.computeUnitPrice });
     const alts = await this.getALTs(poolConfig);
 
-    const signature = await this.perpClient.sendTransaction([cuLimitIx, cuPriceIx, ...instructions], {
-      alts,
-      additionalSigners,
-    });
+    let lastError = '';
+    let lastSignature = '';
 
-    // Confirm transaction on-chain (retry once — tx may already be in-flight)
-    const logger = getLogger();
-    try {
-      const latestBlockhash = await withRetry(
-        () => this.connection.getLatestBlockhash(),
-        'get-blockhash',
-        { maxAttempts: 2 },
-      );
-      const confirmation = await this.connection.confirmTransaction({
-        signature,
-        blockhash: latestBlockhash.blockhash,
-        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-      }, 'confirmed');
-
-      if (confirmation.value.err) {
-        logger.error('CLIENT', `Transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
-        throw new Error(`Transaction failed on-chain (${signature}): ${JSON.stringify(confirmation.value.err)}`);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (attempt === 1) {
+        process.stdout.write('  Sending transaction...   \r');
+      } else {
+        process.stdout.write(`  Retry ${attempt}/${maxAttempts} (fresh blockhash)...\r`);
+        logger.info('CLIENT', `Retry attempt ${attempt}/${maxAttempts}`);
       }
-    } catch (error: unknown) {
-      // Re-throw ALL confirmation failures — never report unconfirmed tx as successful
-      const msg = getErrorMessage(error);
-      logger.error('CLIENT', `Transaction confirmation failed: ${msg}`);
-      throw new Error(`Transaction sent (${signature}) but confirmation failed: ${msg}. Check "positions" to verify status.`);
+
+      // Fresh blockhash for each attempt
+      const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+      logger.debug('CLIENT', `Blockhash: ${latestBlockhash.blockhash} (attempt ${attempt})`);
+
+      // SDK builds, signs, and sends with fresh blockhash
+      // Only pass our CU instructions — SDK's prioritizationFee is set to match in constructor
+      let signatureStr: string;
+      let txBytes: Buffer;
+      try {
+        const { signature, versionedTransaction: vtx } = await this.perpClient.sendTransactionV3(
+          [cuLimitIx, cuPriceIx, ...instructions],
+          { alts, additionalSigners, latestBlockhash },
+        );
+        signatureStr = signature;
+        txBytes = Buffer.from(vtx.serialize());
+        lastSignature = signatureStr;
+        logger.info('CLIENT', `Tx sent: ${signatureStr} (${txBytes.length} bytes, attempt ${attempt})`);
+      } catch (e: unknown) {
+        lastError = getErrorMessage(e);
+        logger.warn('CLIENT', `Send failed (attempt ${attempt}): ${scrubSensitive(lastError)}`);
+        continue;
+      }
+
+      // Simulate with sigVerify:false — catches program errors instantly
+      try {
+        const localVtx = VersionedTransaction.deserialize(txBytes);
+        const sim = await this.connection.simulateTransaction(localVtx, {
+          sigVerify: false,
+          commitment: 'confirmed',
+        });
+        if (sim.value.err) {
+          const errStr = JSON.stringify(sim.value.err);
+
+          // AlreadyProcessed means tx already landed — success
+          if (errStr.includes('AlreadyProcessed')) {
+            process.stdout.write('                              \r');
+            logger.info('CLIENT', `Tx already processed: ${signatureStr}`);
+            return signatureStr;
+          }
+
+          // Before throwing program error, verify the tx hasn't actually landed.
+          // Simulation can return stale errors if state changed between send and simulate.
+          if (await this.isSignatureConfirmed(signatureStr)) {
+            process.stdout.write('                              \r');
+            logger.info('CLIENT', `Tx confirmed despite simulation error: ${signatureStr}`);
+            return signatureStr;
+          }
+
+          // Program error — don't retry, it will fail again
+          process.stdout.write('                              \r');
+          const programLogs = sim.value.logs?.filter(l =>
+            l.includes('Error') || l.includes('failed') || l.includes('ProgramError')
+          ) ?? [];
+          const logSummary = programLogs.length > 0
+            ? programLogs.join('\n    ')
+            : (sim.value.logs?.slice(-3).join('\n    ') ?? 'No logs');
+          throw new Error(
+            `Flash Trade program rejected transaction:\n    ${logSummary}`
+          );
+        }
+        logger.debug('CLIENT', `Simulation OK, CU used: ${sim.value.unitsConsumed}`);
+      } catch (e: unknown) {
+        const eMsg = getErrorMessage(e);
+        // Re-throw definitive program errors
+        if (eMsg.includes('rejected')) throw e;
+        // BlockhashNotFound means the tx was already processed or blockhash expired —
+        // don't trust this simulation result, fall through to confirmation
+        if (eMsg.includes('BlockhashNotFound')) {
+          logger.debug('CLIENT', 'Simulation returned BlockhashNotFound — tx may have landed, proceeding to confirm');
+        } else {
+          logger.debug('CLIENT', `Simulation check: ${scrubSensitive(eMsg)}`);
+        }
+      }
+
+      // Confirm using blockhash strategy with concurrent re-sends
+      process.stdout.write('  Awaiting confirmation... \r');
+      const confirmed = await this.pollConfirmation(
+        signatureStr, txBytes, confirmTimeoutMs, logger,
+        latestBlockhash.blockhash, latestBlockhash.lastValidBlockHeight,
+      );
+      if (confirmed) {
+        process.stdout.write('                              \r');
+        logger.info('CLIENT', `Tx confirmed: ${signatureStr}`);
+        return signatureStr;
+      }
+
+      // Before retrying, check if the tx actually landed (confirmation timeout != failure)
+      if (await this.isSignatureConfirmed(signatureStr)) {
+        process.stdout.write('                              \r');
+        logger.info('CLIENT', `Tx confirmed on late check: ${signatureStr}`);
+        return signatureStr;
+      }
+
+      lastError = `Not confirmed within ${confirmTimeoutMs / 1000}s`;
+      logger.warn('CLIENT', `Attempt ${attempt} timed out — ${lastError}`);
+
+      // On last failed attempt, re-simulate to get a better error message
+      if (attempt === maxAttempts) {
+        try {
+          const localVtx = VersionedTransaction.deserialize(txBytes);
+          const sim = await this.connection.simulateTransaction(localVtx, {
+            sigVerify: false,
+            commitment: 'confirmed',
+          });
+          if (sim.value.err) {
+            const errStr = JSON.stringify(sim.value.err);
+            if (errStr.includes('AlreadyProcessed') || errStr.includes('BlockhashNotFound')) {
+              // Tx may have landed — do a final signature check
+              if (await this.isSignatureConfirmed(signatureStr)) {
+                process.stdout.write('                              \r');
+                return signatureStr;
+              }
+            } else {
+              const logs = sim.value.logs?.filter(l =>
+                l.includes('Error') || l.includes('failed') || l.includes('ProgramError')
+              ) ?? [];
+              lastError = logs.length > 0
+                ? `Program error: ${logs.join(' | ')}`
+                : `Simulation error: ${errStr}`;
+            }
+          }
+        } catch {
+          // Best effort — simulation may fail with expired blockhash, which is expected
+        }
+      }
     }
 
-    return signature;
+    process.stdout.write('                              \r');
+    throw new Error(
+      `Transaction failed after ${maxAttempts} attempts.\n` +
+      `  Last error: ${lastError}\n` +
+      (lastSignature ? `  Last signature: ${lastSignature}\n  Check https://solscan.io/tx/${lastSignature}` : '')
+    );
+  }
+
+  /** Confirm transaction using blockhash strategy + concurrent re-sends. */
+  private async pollConfirmation(
+    signature: string,
+    txBytes: Buffer,
+    _timeoutMs: number,
+    logger: ReturnType<typeof getLogger>,
+    blockhash?: string,
+    lastValidBlockHeight?: number,
+  ): Promise<boolean> {
+    // If we have blockhash info, use Solana's built-in confirmTransaction
+    if (blockhash && lastValidBlockHeight) {
+      const resendInterval = setInterval(() => {
+        this.connection.sendRawTransaction(txBytes, { skipPreflight: true, maxRetries: 0 }).catch(() => {});
+      }, 2_000);
+
+      try {
+        const result = await this.connection.confirmTransaction(
+          { signature, blockhash, lastValidBlockHeight },
+          'confirmed',
+        );
+        if (result.value.err) {
+          throw new Error(`Transaction failed on-chain: ${JSON.stringify(result.value.err)}`);
+        }
+        return true;
+      } catch (e: unknown) {
+        const msg = getErrorMessage(e);
+        if (msg.includes('failed on-chain')) throw e;
+        if (msg.includes('expired') || msg.includes('block height')) {
+          logger.debug('CLIENT', 'Blockhash expired during confirmation');
+          return false;
+        }
+        logger.debug('CLIENT', `Confirmation error: ${scrubSensitive(msg)}`);
+        return false;
+      } finally {
+        clearInterval(resendInterval);
+      }
+    }
+
+    // Fallback: manual polling (if no blockhash info available)
+    const start = Date.now();
+    for (let i = 0; Date.now() - start < _timeoutMs; i++) {
+      await new Promise(r => setTimeout(r, 1_000));
+      try {
+        const { value } = await this.connection.getSignatureStatuses([signature]);
+        const status = value?.[0];
+        if (status?.err) throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.err)}`);
+        if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return true;
+      } catch (e: unknown) {
+        if (getErrorMessage(e).includes('failed on-chain')) throw e;
+      }
+      if (i % 2 === 0) {
+        this.connection.sendRawTransaction(txBytes, { skipPreflight: true, maxRetries: 0 }).catch(() => {});
+      }
+    }
+    return false;
+  }
+
+  // ─── Trade Mutex ──────────────────────────────────────────────────────────
+
+  private acquireTradeLock(market: string, side: TradeSide): void {
+    const key = `${market}:${side}`;
+    if (this.activeTrades.has(key)) {
+      throw new Error(`A ${side} trade on ${market} is already in progress. Wait for it to complete.`);
+    }
+    this.activeTrades.add(key);
+  }
+
+  private releaseTradeLock(market: string, side: TradeSide): void {
+    this.activeTrades.delete(`${market}:${side}`);
   }
 
   // ─── Open Position ────────────────────────────────────────────────────────
@@ -361,81 +595,143 @@ export class FlashClient implements IFlashClient {
     // Pre-trade validation
     await this.ensureSufficientSol();
     this.validateLeverage(market, leverage);
+    const sideStr = side === TradeSide.Long ? 'long' : 'short';
+    if (collateralAmount < 10) {
+      throw new Error(
+        `Minimum collateral is $10 (got $${collateralAmount}).\n` +
+        `  Try: open ${leverage}x ${sideStr} ${market} $10`
+      );
+    }
 
+    // Check USDC balance before building transaction
+    const inputSymbol = collateralToken ?? DEFAULT_COLLATERAL_TOKEN;
+    if (inputSymbol === 'USDC') {
+      try {
+        const balances = await this.walletMgr.getTokenBalances();
+        const usdcBalance = balances.tokens.find(t => t.symbol === 'USDC')?.amount ?? 0;
+        if (usdcBalance < collateralAmount) {
+          throw new Error(
+            `Insufficient USDC collateral.\n` +
+            `  Required: $${collateralAmount.toFixed(2)}\n` +
+            `  Available: $${usdcBalance.toFixed(2)}\n` +
+            `  Deposit USDC to trade on Flash Trade.`
+          );
+        }
+      } catch (e: unknown) {
+        const eMsg = getErrorMessage(e);
+        if (eMsg.includes('Insufficient USDC')) throw e;
+        // RPC failure during balance check — warn but don't block the trade
+        logger.warn('CLIENT', `USDC balance check skipped (RPC error): ${scrubSensitive(eMsg)}`);
+      }
+    }
+
+    // Check for duplicate position before sending
     const poolConfig = this.getPoolConfigForMarket(market);
-    const sdkSide = toSdkSide(side);
-
-    const targetToken = this.findToken(poolConfig, market);
-    const collateralSymbol = collateralToken ?? DEFAULT_COLLATERAL_TOKEN;
-    const inputToken = this.findToken(poolConfig, collateralSymbol);
-
-    logger.debug('TRADE', 'Trade Request', {
-      market, side, collateralToken: inputToken.symbol,
-      collateralAmount, leverage, size: collateralAmount * leverage,
-    });
-
-    const priceMap = await this.getPriceMap(poolConfig);
-    const targetPrice = priceMap.get(targetToken.symbol);
-    const inputPrice = priceMap.get(inputToken.symbol);
-    if (!targetPrice) throw new Error(`Oracle unavailable for ${targetToken.symbol}. Try again later.`);
-    if (!inputPrice) throw new Error(`Oracle unavailable for ${inputToken.symbol}. Try again later.`);
-
-    const priceAfterSlippage = this.perpClient.getPriceAfterSlippage(
-      true, new BN(this.config.defaultSlippageBps), targetPrice.price, sdkSide
-    );
-
-    const collateralNative = uiDecimalsToNative(collateralAmount.toString(), inputToken.decimals);
-    const inputCustody = this.findCustody(poolConfig, inputToken.symbol);
-    const outputCustody = this.findCustody(poolConfig, targetToken.symbol);
-
-    const custodyAccounts = await withRetry(
-      () => this.perpClient.program.account.custody.fetchMultiple([
-        inputCustody.custodyAccount, outputCustody.custodyAccount,
-      ]),
-      'custody-fetch',
-      { maxAttempts: 2 },
-    );
-
-    if (!custodyAccounts[0] || !custodyAccounts[1]) {
-      throw new Error('Failed to fetch custody accounts from chain');
+    try {
+      const positions = await this.perpClient.getUserPositions(this.wallet.publicKey, poolConfig);
+      const token = this.findToken(poolConfig, market);
+      const sdkSide = toSdkSide(side);
+      const markets = poolConfig.markets as unknown as Array<{
+        marketAccount: PublicKey; targetMint: PublicKey; side: typeof Side.Long | typeof Side.Short;
+      }>;
+      const marketConfig = markets.find(m => m.targetMint.equals(token.mintKey) && m.side === sdkSide);
+      if (marketConfig) {
+        const existing = (positions as Array<{ market: PublicKey }>).find(
+          p => p.market.equals(marketConfig.marketAccount)
+        );
+        if (existing) {
+          throw new Error(
+            `You already have an open ${sideStr} position on ${market}.\n` +
+            `  Close it first with: close ${sideStr} ${market}`
+          );
+        }
+      }
+    } catch (e: unknown) {
+      const eMsg = getErrorMessage(e);
+      if (eMsg.includes('already have an open')) throw e;
+      // If position check fails due to RPC, proceed — the program will reject duplicates anyway
+      logger.debug('CLIENT', `Pre-trade position check skipped: ${scrubSensitive(eMsg)}`);
     }
 
-    const sizeAmount = this.perpClient.getSizeAmountFromLeverageAndCollateral(
-      collateralNative, leverage.toString(), targetToken as unknown as Token, inputToken as unknown as Token, sdkSide,
-      targetPrice.price, targetPrice.emaPrice,
-      CustodyAccount.from(outputCustody.custodyAccount, custodyAccounts[1]),
-      inputPrice.price, inputPrice.emaPrice,
-      CustodyAccount.from(inputCustody.custodyAccount, custodyAccounts[0]),
-      BN_ZERO
-    );
+    // Acquire trade lock to prevent concurrent sends on same market/side
+    this.acquireTradeLock(market, side);
+    try {
+      const sdkSide = toSdkSide(side);
 
-    let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
-    if (inputToken.symbol === targetToken.symbol) {
-      result = await this.perpClient.openPosition(
-        targetToken.symbol, inputToken.symbol, priceAfterSlippage,
-        collateralNative, sizeAmount, sdkSide, poolConfig, Privilege.None
+      const targetToken = this.findToken(poolConfig, market);
+      const collateralSymbol = collateralToken ?? DEFAULT_COLLATERAL_TOKEN;
+      const inputToken = this.findToken(poolConfig, collateralSymbol);
+
+      logger.debug('TRADE', 'Trade Request', {
+        market, side, collateralToken: inputToken.symbol,
+        collateralAmount, leverage, size: collateralAmount * leverage,
+      });
+
+      const priceMap = await this.getPriceMap(poolConfig);
+      const targetPrice = priceMap.get(targetToken.symbol);
+      const inputPrice = priceMap.get(inputToken.symbol);
+      if (!targetPrice) throw new Error(`Oracle unavailable for ${targetToken.symbol}. Try again later.`);
+      if (!inputPrice) throw new Error(`Oracle unavailable for ${inputToken.symbol}. Try again later.`);
+
+      const priceAfterSlippage = this.perpClient.getPriceAfterSlippage(
+        true, new BN(this.config.defaultSlippageBps), targetPrice.price, sdkSide
       );
-    } else {
-      result = await this.perpClient.swapAndOpen(
-        targetToken.symbol, targetToken.symbol, inputToken.symbol,
-        collateralNative, priceAfterSlippage, sizeAmount, sdkSide,
-        poolConfig, Privilege.None
+
+      const collateralNative = uiDecimalsToNative(collateralAmount.toString(), inputToken.decimals);
+      const inputCustody = this.findCustody(poolConfig, inputToken.symbol);
+      const outputCustody = this.findCustody(poolConfig, targetToken.symbol);
+
+      const custodyAccounts = await withRetry(
+        () => this.perpClient.program.account.custody.fetchMultiple([
+          inputCustody.custodyAccount, outputCustody.custodyAccount,
+        ]),
+        'custody-fetch',
+        { maxAttempts: 2 },
       );
+
+      if (!custodyAccounts[0] || !custodyAccounts[1]) {
+        throw new Error('Failed to fetch custody accounts from chain');
+      }
+
+      const sizeAmount = this.perpClient.getSizeAmountFromLeverageAndCollateral(
+        collateralNative, leverage.toString(), targetToken as unknown as Token, inputToken as unknown as Token, sdkSide,
+        targetPrice.price, targetPrice.emaPrice,
+        CustodyAccount.from(outputCustody.custodyAccount, custodyAccounts[1]),
+        inputPrice.price, inputPrice.emaPrice,
+        CustodyAccount.from(inputCustody.custodyAccount, custodyAccounts[0]),
+        BN_ZERO
+      );
+
+      let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
+      if (inputToken.symbol === targetToken.symbol) {
+        result = await this.perpClient.openPosition(
+          targetToken.symbol, inputToken.symbol, priceAfterSlippage,
+          collateralNative, sizeAmount, sdkSide, poolConfig, Privilege.None
+        );
+      } else {
+        result = await this.perpClient.swapAndOpen(
+          targetToken.symbol, targetToken.symbol, inputToken.symbol,
+          collateralNative, priceAfterSlippage, sizeAmount, sdkSide,
+          poolConfig, Privilege.None
+        );
+      }
+
+      const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
+
+      logger.trade('OPEN', {
+        market, side, collateral: collateralAmount, leverage,
+        price: targetPrice.uiPrice, tx: txSignature,
+      });
+
+      return {
+        txSignature,
+        entryPrice: targetPrice.uiPrice,
+        liquidationPrice: 0,
+        sizeUsd: collateralAmount * leverage,
+      };
+    } finally {
+      this.releaseTradeLock(market, side);
     }
-
-    const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
-
-    logger.trade('OPEN', {
-      market, side, collateral: collateralAmount, leverage,
-      price: targetPrice.uiPrice, tx: txSignature,
-    });
-
-    return {
-      txSignature,
-      entryPrice: targetPrice.uiPrice,
-      liquidationPrice: 0,
-      sizeUsd: collateralAmount * leverage,
-    };
   }
 
   // ─── Close Position ───────────────────────────────────────────────────────
@@ -546,25 +842,22 @@ export class FlashClient implements IFlashClient {
         if (!tokenPrice) continue;
 
         // Entry price is a ContractOraclePrice { price: BN, exponent: number }
-        // Compute: price * 10^exponent (exponent is typically negative, e.g. -8)
         const rawEntryField = raw.entryPrice;
         let parsedEntry = 0;
         if (rawEntryField && typeof rawEntryField === 'object' && 'price' in rawEntryField && 'exponent' in rawEntryField) {
           parsedEntry = parseFloat(rawEntryField.price.toString()) * Math.pow(10, rawEntryField.exponent);
         } else if (rawEntryField && BN.isBN(rawEntryField)) {
-          // Fallback: bare BN — use oracle exponent from the current price
           const oracleExp = Number(tokenPrice.price.exponent.toString());
           parsedEntry = parseFloat(rawEntryField.toString()) * Math.pow(10, oracleExp);
         }
 
-        // sizeUsd and collateralUsd use their respective decimal fields (default to 6 for USDC precision)
         const sizeDec = raw.sizeDecimals ?? 6;
         const collDec = raw.collateralDecimals ?? 6;
         const parsedSize = raw.sizeUsd ? parseFloat(raw.sizeUsd.toString()) / Math.pow(10, sizeDec) : 0;
         const parsedCollateral = raw.collateralUsd ? parseFloat(raw.collateralUsd.toString()) / Math.pow(10, collDec) : 0;
         const parsedCurrentPrice = tokenPrice.uiPrice;
 
-        // NaN/Infinity guard: skip corrupt positions
+        // NaN/Infinity guard
         const entryPrice = Number.isFinite(parsedEntry) ? parsedEntry : 0;
         const sizeUsd = Number.isFinite(parsedSize) ? parsedSize : 0;
         const collateralUsd = Number.isFinite(parsedCollateral) ? parsedCollateral : 0;

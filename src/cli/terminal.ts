@@ -17,7 +17,7 @@ import { getAutopilot, setClawdApiKey, getInspector, getScanner, getRegimeDetect
 import { formatUsd, colorPercent } from '../utils/format.js';
 import { MarketRegime } from '../regime/regime-types.js';
 
-const COMMAND_TIMEOUT_MS = 30_000;
+const COMMAND_TIMEOUT_MS = 120_000;
 const SLOW_COMMAND_MS = 3_000;
 const HISTORY_FILE = join(homedir(), '.flash', 'history');
 const MAX_HISTORY = 1000;
@@ -170,6 +170,32 @@ export class FlashTerminal {
 
     // ─── Initialize Client ───────────────────────────────────────────
     const connection = createConnection(this.config.rpcUrl);
+
+    // Warn if using public RPC for live trading
+    if (!this.config.simulationMode && this.config.rpcUrl.includes('api.mainnet-beta.solana.com')) {
+      console.log(chalk.yellow('\n  ⚠ Using default public RPC — transactions may be slow or fail.'));
+      console.log(chalk.dim('    Set RPC_URL in .env for reliable execution (e.g. Helius, QuickNode).'));
+    }
+
+    // RPC latency check (non-blocking, 3-call average to avoid cold-start bias)
+    if (!this.config.simulationMode) {
+      (async () => {
+        try {
+          let total = 0;
+          for (let i = 0; i < 3; i++) {
+            const s = Date.now();
+            await connection.getLatestBlockhash('confirmed');
+            total += Date.now() - s;
+          }
+          const avg = Math.round(total / 3);
+          if (avg > 600) {
+            console.log(chalk.yellow(`\n  ⚠ RPC latency is high (${avg}ms average).`));
+            console.log(chalk.dim('    Transaction confirmations may be slower.'));
+            console.log(chalk.dim('    Consider switching to a faster RPC provider.\n'));
+          }
+        } catch { /* non-critical */ }
+      })();
+    }
 
     if (this.config.simulationMode) {
       this.flashClient = new SimulatedFlashClient(10_000);
@@ -502,18 +528,12 @@ export class FlashTerminal {
       console.log('');
       console.log(chalk.yellow('  WARNING'));
       console.log(chalk.dim('  Transactions executed here are real.'));
+      console.log('');
+      console.log(chalk.dim('  Flash Trade requires USDC collateral.'));
+      console.log(chalk.dim('  Ensure your wallet holds USDC before opening positions.'));
+      console.log(chalk.dim('  Run "wallet tokens" to check balances.'));
     }
     console.log('');
-
-    // Fetch intelligence data with a timeout — don't block startup
-    try {
-      const intel = await this.fetchIntelligence();
-      if (intel) {
-        this.renderIntelligence(intel);
-      }
-    } catch {
-      // Intelligence screen is best-effort — startup continues regardless
-    }
 
     console.log(chalk.dim('  Type "help" for commands, "scan" for opportunities.'));
     console.log(chalk.dim('  Type "exit" to close the terminal.'));
@@ -1006,18 +1026,20 @@ export class FlashTerminal {
     if (result.requiresConfirmation && result.data?.executeAction) {
       const confirmed = await this.confirm(result.confirmationPrompt ?? 'Confirm?');
       if (confirmed) {
-        process.stdout.write(chalk.dim('  Submitting...\r'));
+        console.log(chalk.dim('  Submitting transaction...'));
 
         try {
+          const submitStart = Date.now();
           const execResult = await withTimeout(
             result.data.executeAction(),
             COMMAND_TIMEOUT_MS,
             'transaction',
           );
-          process.stdout.write('                \r');
+          const elapsed = ((Date.now() - submitStart) / 1000).toFixed(1);
+          console.log(chalk.green(`  Confirmed in ${elapsed}s`));
           console.log(execResult.message);
         } catch (error: unknown) {
-          console.log(chalk.red(`  Transaction failed: ${getErrorMessage(error)}`));
+          console.log(chalk.red(`  ${getErrorMessage(error)}`));
         }
       } else {
         console.log(chalk.dim('  Cancelled.'));

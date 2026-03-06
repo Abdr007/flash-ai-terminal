@@ -18,6 +18,9 @@ import { getErrorMessage } from '../utils/retry.js';
 
 export type AutopilotTradeHandler = (suggestion: TradeSuggestion) => Promise<void>;
 
+/** Minimum balance (USDC) required to trade */
+const MIN_TRADE_BALANCE = 10;
+
 /**
  * Autopilot trading loop.
  * Monitors markets, evaluates signals, runs risk checks,
@@ -190,7 +193,10 @@ export class Autopilot {
 
   private async cycle(): Promise<void> {
     // Concurrency guard: prevent overlapping cycles
-    if (this.cycleRunning) return;
+    if (this.cycleRunning) {
+      getLogger().debug('AUTOPILOT', 'Skipping cycle — previous cycle still running');
+      return;
+    }
     this.cycleRunning = true;
 
     const logger = getLogger();
@@ -201,7 +207,7 @@ export class Autopilot {
       // Active check: abort if stopped mid-cycle
       if (!this.state.active) return;
 
-      // 1. Fetch positions and portfolio (scanner handles market/volume/OI data internally)
+      // 1. Fetch FRESH positions and portfolio each cycle (no stale cached data)
       const [positions, portfolio] = await Promise.all([
         this.inspector.getPositions(),
         this.inspector.getPortfolio(),
@@ -209,11 +215,13 @@ export class Autopilot {
 
       if (!this.state.active) return;
 
-      // Balance guard: never trade with zero or negative balance
-      const balance = this.context.flashClient.getBalance();
-      if (balance <= 0) {
-        logger.warn('AUTOPILOT', `Cycle ${this.state.cycleCount}: Balance is ${balance} — skipping`);
-        this.log(chalk.yellow('  [Autopilot] Insufficient balance — skipping cycle'));
+      // Balance guard: use USDC balance from portfolio if available, fall back to SOL balance
+      const usdcBalance = (portfolio as { usdcBalance?: number }).usdcBalance ?? 0;
+      const balance = usdcBalance > 0 ? usdcBalance : this.context.flashClient.getBalance();
+
+      if (balance < MIN_TRADE_BALANCE) {
+        logger.warn('AUTOPILOT', `Cycle ${this.state.cycleCount}: Balance $${balance.toFixed(2)} below minimum $${MIN_TRADE_BALANCE} — skipping`);
+        this.log(chalk.yellow(`  [Autopilot] Insufficient balance ($${balance.toFixed(2)}) — skipping cycle`));
         return;
       }
 
@@ -341,7 +349,7 @@ export class Autopilot {
         return;
       }
 
-      // 6. Execute in simulation mode
+      // 7. Execute in simulation mode
       const sideColor = suggestion.side === 'long' ? chalk.green : chalk.red;
       const msg = `  [Autopilot] Signal: ${sideColor(suggestion.side.toUpperCase())} ${suggestion.market} ${suggestion.leverage}x ${formatUsd(suggestion.collateral)} (${(suggestion.confidence * 100).toFixed(0)}%)`;
 

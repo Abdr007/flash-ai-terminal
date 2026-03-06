@@ -113,10 +113,19 @@ export class Logger {
     }
   }
 
+  /** Scrub sensitive data from strings before writing to logs. */
+  private scrub(text: string): string {
+    return text
+      .replace(/api[_-]?key=[^&\s"]+/gi, 'api_key=***')
+      .replace(/sk-ant-[^\s"]+/g, 'sk-ant-***')
+      .replace(/gsk_[^\s"]+/g, 'gsk_***');
+  }
+
   private writeToFile(entry: LogEntry): void {
     if (!this.logFilePath) return;
     const dataStr = entry.data ? ` ${JSON.stringify(entry.data)}` : '';
-    const line = `[${entry.timestamp}] ${LEVEL_LABELS[entry.level]} [${entry.category}] ${entry.message}${dataStr}\n`;
+    const raw = `[${entry.timestamp}] ${LEVEL_LABELS[entry.level]} [${entry.category}] ${entry.message}${dataStr}\n`;
+    const line = this.scrub(raw);
     appendFile(this.logFilePath, line, () => {
       // Fire-and-forget — silently ignore write errors to avoid crashing the CLI
     });

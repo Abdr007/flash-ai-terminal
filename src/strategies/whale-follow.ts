@@ -14,6 +14,7 @@ export interface WhaleFollowInput {
 }
 
 const WHALE_SIZE_THRESHOLD = 10_000; // $10K minimum to consider "whale"
+const MAX_WHALE_EVENTS = 100; // Cap input arrays to prevent unbounded processing
 
 /**
  * Compute a whale-follow signal by tracking direction of large positions.
@@ -21,12 +22,16 @@ const WHALE_SIZE_THRESHOLD = 10_000; // $10K minimum to consider "whale"
 export function computeWhaleFollowSignal({ recentActivity, openPositions, targetMarket }: WhaleFollowInput): StrategySignal {
   const marketUpper = targetMarket.toUpperCase();
 
+  // Cap input arrays before processing
+  const cappedActivity = recentActivity.slice(0, MAX_WHALE_EVENTS);
+  const cappedPositions = openPositions.slice(0, MAX_WHALE_EVENTS);
+
   // Filter for whale-size activities in this market
-  const whaleActivity = recentActivity.filter(
+  const whaleActivity = cappedActivity.filter(
     (a) => a.market.toUpperCase() === marketUpper && a.sizeUsd >= WHALE_SIZE_THRESHOLD
   );
 
-  const whalePositions = openPositions.filter(
+  const whalePositions = cappedPositions.filter(
     (p) => p.market.toUpperCase() === marketUpper && p.sizeUsd >= WHALE_SIZE_THRESHOLD
   );
 
