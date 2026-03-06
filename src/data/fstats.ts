@@ -52,11 +52,15 @@ interface RawLeaderboardEntry {
   owner?: string;
   pnl?: number;
   net_pnl?: number;
+  gross_pnl?: number;
   volume?: number;
   total_volume?: number;
+  total_volume_usd?: number;
   trades?: number;
   total_trades?: number;
+  num_trades?: number;
   win_rate?: number;
+  rank?: number;
 }
 
 interface RawTraderProfile {
@@ -125,7 +129,7 @@ function safeArray<T>(raw: unknown): T[] {
   if (raw && typeof raw === 'object') {
     const obj = raw as Record<string, unknown>;
     // Handle common API wrapper patterns: { data: [...] }, { markets: [...] }, etc.
-    for (const key of ['data', 'markets', 'items', 'results', 'entries']) {
+    for (const key of ['data', 'markets', 'items', 'results', 'entries', 'leaderboard']) {
       if (key in obj && Array.isArray(obj[key])) return obj[key] as T[];
     }
   }
@@ -222,11 +226,11 @@ export class FStatsClient implements IDataClient {
     );
     const entries = safeArray<RawLeaderboardEntry>(raw);
     return entries.map((entry, i) => ({
-      rank: i + 1,
+      rank: entry.rank ?? i + 1,
       address: entry.address ?? entry.owner ?? '',
       pnl: entry.pnl ?? entry.net_pnl ?? 0,
-      volume: entry.volume ?? entry.total_volume ?? 0,
-      trades: entry.trades ?? entry.total_trades ?? 0,
+      volume: entry.volume ?? entry.total_volume ?? entry.total_volume_usd ?? 0,
+      trades: entry.trades ?? entry.total_trades ?? entry.num_trades ?? 0,
       winRate: entry.win_rate ?? 0,
     }));
   }

@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { ParsedIntent, ParsedIntentSchema, ActionType, TradeSide } from '../types/index.js';
 import { getAllMarkets } from '../config/index.js';
 import { getLogger } from '../utils/logger.js';
@@ -356,10 +357,14 @@ export function localParse(input: string): ParsedIntent | null {
 }
 
 export class AIInterpreter {
-  private client: Anthropic;
+  private anthropic: Anthropic | null;
+  private groq: OpenAI | null;
 
-  constructor(apiKey: string) {
-    this.client = new Anthropic({ apiKey });
+  constructor(apiKey: string, groqApiKey?: string) {
+    this.anthropic = apiKey ? new Anthropic({ apiKey }) : null;
+    this.groq = groqApiKey
+      ? new OpenAI({ apiKey: groqApiKey, baseURL: 'https://api.groq.com/openai/v1' })
+      : null;
   }
 
   private static readonly MAX_INPUT_LENGTH = 500;
@@ -375,13 +380,29 @@ export class AIInterpreter {
       return localResult;
     }
 
-    // Input length limit before sending to Claude
+    // Input length limit before sending to AI
     if (userInput.length > AIInterpreter.MAX_INPUT_LENGTH) {
       logger.warn('AI', `Input too long (${userInput.length} chars, max ${AIInterpreter.MAX_INPUT_LENGTH})`);
       return { action: ActionType.Help };
     }
 
-    // Fall back to Claude for complex inputs
+    // Try Anthropic first, then Groq as fallback
+    if (this.anthropic) {
+      const result = await this.tryAnthropic(userInput);
+      if (result) return result;
+    }
+
+    if (this.groq) {
+      const result = await this.tryGroq(userInput);
+      if (result) return result;
+    }
+
+    logger.warn('AI', 'No AI provider available. Using local parsing only.');
+    return { action: ActionType.Help };
+  }
+
+  private async tryAnthropic(userInput: string): Promise<ParsedIntent | null> {
+    const logger = getLogger();
     logger.debug('AI', 'Calling Claude API', { input: userInput });
 
     try {
@@ -390,7 +411,7 @@ export class AIInterpreter {
 
       let response;
       try {
-        response = await this.client.messages.create({
+        response = await this.anthropic!.messages.create({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 256,
           system: SYSTEM_PROMPT,
@@ -402,18 +423,59 @@ export class AIInterpreter {
 
       if (response.content.length === 0 || response.content[0].type !== 'text') {
         logger.warn('AI', 'Empty response from Claude');
-        return { action: ActionType.Help };
+        return null;
       }
 
-      const text = response.content[0].text;
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        logger.warn('AI', 'No JSON in Claude response', { text });
-        return { action: ActionType.Help };
+      return this.parseJsonResponse(response.content[0].text, 'Claude');
+    } catch (error: unknown) {
+      const msg = getErrorMessage(error);
+      if (msg.includes('credit balance') || msg.includes('401') || msg.includes('403') || msg.includes('429') || msg.includes('abort') || msg.includes('timeout')) {
+        logger.warn('AI', `Claude unavailable (${msg}). Trying fallback...`);
+      } else {
+        logger.error('AI', `Claude parse failed: ${msg}`);
+      }
+      return null;
+    }
+  }
+
+  private async tryGroq(userInput: string): Promise<ParsedIntent | null> {
+    const logger = getLogger();
+    logger.debug('AI', 'Calling Groq API', { input: userInput });
+
+    try {
+      const response = await this.groq!.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 256,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userInput },
+        ],
+        temperature: 0,
+      });
+
+      const text = response.choices[0]?.message?.content;
+      if (!text) {
+        logger.warn('AI', 'Empty response from Groq');
+        return null;
       }
 
+      return this.parseJsonResponse(text, 'Groq');
+    } catch (error: unknown) {
+      logger.warn('AI', `Groq parse failed: ${getErrorMessage(error)}`);
+      return null;
+    }
+  }
+
+  private parseJsonResponse(text: string, source: string): ParsedIntent | null {
+    const logger = getLogger();
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      logger.warn('AI', `No JSON in ${source} response`, { text });
+      return null;
+    }
+
+    try {
       const parsed: unknown = JSON.parse(jsonMatch[0]);
-      // Normalize market to uppercase
       if (typeof parsed === 'object' && parsed !== null && 'market' in parsed) {
         const obj = parsed as Record<string, unknown>;
         if (typeof obj.market === 'string') {
@@ -422,17 +484,11 @@ export class AIInterpreter {
       }
 
       const validated = ParsedIntentSchema.parse(parsed);
-      logger.debug('AI', 'Claude parsed intent', { action: validated.action });
+      logger.debug('AI', `${source} parsed intent`, { action: validated.action });
       return validated;
     } catch (error: unknown) {
-      const msg = getErrorMessage(error);
-      // Graceful fallback on API errors (billing, network, auth)
-      if (msg.includes('credit balance') || msg.includes('401') || msg.includes('403') || msg.includes('429') || msg.includes('abort') || msg.includes('timeout')) {
-        logger.warn('AI', `Claude API unavailable (${msg}). Using local parsing only.`);
-      } else {
-        logger.error('AI', `Parse failed: ${msg}`);
-      }
-      return { action: ActionType.Help };
+      logger.warn('AI', `${source} JSON parse failed: ${getErrorMessage(error)}`);
+      return null;
     }
   }
 }

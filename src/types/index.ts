@@ -593,6 +593,7 @@ export interface ToolContext {
   dataClient: IDataClient;
   simulationMode: boolean;
   walletAddress: string;
+  walletName: string;
   walletManager?: WalletManager;
 }
 
@@ -613,6 +614,7 @@ export interface FlashConfig {
   pythnetUrl: string;
   walletPath: string;
   anthropicApiKey: string;
+  groqApiKey: string;
   defaultPool: string;
   network: Network;
   simulationMode: boolean;

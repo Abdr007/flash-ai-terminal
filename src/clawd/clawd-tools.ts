@@ -36,15 +36,22 @@ let inspectorInstance: SolanaInspector | null = null;
 let scannerInstance: MarketScanner | null = null;
 let portfolioManagerInstance: PortfolioManager | null = null;
 let _clawdApiKey: string | undefined;
+let _groqApiKey: string | undefined;
 
-/** Set the Anthropic API key for Clawd tools only. Called once at startup. */
-export function setClawdApiKey(apiKey: string | undefined): void {
+/** Set AI API keys for Clawd tools. Called once at startup. */
+export function setClawdApiKey(apiKey: string | undefined, groqApiKey?: string): void {
   _clawdApiKey = apiKey;
+  _groqApiKey = groqApiKey;
 }
 
-/** Get the scoped API key (not stored in ToolContext). */
+/** Get the scoped Anthropic API key. */
 export function getClawdApiKey(): string | undefined {
   return _clawdApiKey;
+}
+
+/** Get the scoped Groq API key. */
+export function getGroqApiKey(): string | undefined {
+  return _groqApiKey;
 }
 
 export function getInspector(context: ToolContext): SolanaInspector {
@@ -302,9 +309,9 @@ export const clawdSuggestTrade: ToolDefinition = {
     let suggestion;
     let source: 'claude' | 'strategy_engine' = 'claude';
 
-    if (hasApiKey) {
-      // Try Claude first — it will auto-fallback to strategy engine on failure
-      const agent = new ClawdAgent(apiKey!);
+    const groqKey = getGroqApiKey();
+    if (hasApiKey || groqKey) {
+      const agent = new ClawdAgent(apiKey ?? '', groqKey);
       suggestion = await agent.suggestTrade({
         markets: relevantMarkets,
         signals,

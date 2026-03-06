@@ -19,7 +19,7 @@ import { MarketRegime } from '../regime/regime-types.js';
 
 const COMMAND_TIMEOUT_MS = 30_000;
 const SLOW_COMMAND_MS = 3_000;
-const HISTORY_FILE = join(homedir(), '.flash_terminal_history');
+const HISTORY_FILE = join(homedir(), '.flash', 'history');
 const MAX_HISTORY = 1000;
 
 /** Single-token fast dispatch — skips interpreter entirely */
@@ -120,8 +120,14 @@ export class FlashTerminal {
 
     initLogger(config.logFile ? { logFile: config.logFile } : undefined);
 
-    if (config.anthropicApiKey && config.anthropicApiKey !== 'sk-ant-...') {
-      this.interpreter = new AIInterpreter(config.anthropicApiKey);
+    const hasAnthropicKey = config.anthropicApiKey && config.anthropicApiKey !== 'sk-ant-...';
+    const hasGroqKey = !!config.groqApiKey;
+
+    if (hasAnthropicKey || hasGroqKey) {
+      this.interpreter = new AIInterpreter(
+        hasAnthropicKey ? config.anthropicApiKey : '',
+        hasGroqKey ? config.groqApiKey : undefined,
+      );
     } else {
       this.interpreter = new OfflineInterpreter();
     }
@@ -150,7 +156,7 @@ export class FlashTerminal {
     this.modeLocked = true;
 
     // ─── Mode-Specific Setup ──────────────────────────────────────────
-    let walletInfo: { address: string } | null = null;
+    let walletInfo: { address: string; name: string } | null = null;
 
     if (mode === 'live') {
       walletInfo = await this.setupLiveMode();
@@ -185,17 +191,18 @@ export class FlashTerminal {
       dataClient: this.fstats,
       simulationMode: this.config.simulationMode,
       walletAddress: walletInfo?.address ?? this.flashClient.walletAddress ?? 'unknown',
+      walletName: walletInfo?.name ?? '',
       walletManager: this.walletManager,
     };
 
-    setClawdApiKey(this.config.anthropicApiKey);
+    setClawdApiKey(this.config.anthropicApiKey, this.config.groqApiKey);
     this.engine = new ToolEngine(this.context);
 
     // Set prompt based on mode
     this.updatePrompt();
 
     // ─── Display Intelligence Screen ─────────────────────────────────
-    await this.showIntelligenceScreen(walletInfo?.address ?? null);
+    await this.showIntelligenceScreen(walletInfo?.name ?? null);
 
     // ─── Signal Handlers ──────────────────────────────────────────────
     process.on('SIGINT', () => this.shutdown());
@@ -303,107 +310,118 @@ export class FlashTerminal {
 
   /**
    * Set up live mode: ensure a wallet is connected.
+   * Auto-connects if a default or single wallet exists.
    * Returns wallet info on success, null if user chose exit.
    */
-  private async setupLiveMode(): Promise<{ address: string } | null> {
-    // Try auto-loading default wallet first
+  private async setupLiveMode(): Promise<{ address: string; name: string } | null> {
     const store = new WalletStore();
-    const defaultWallet = store.getDefault();
+    const wallets = store.listWallets();
+    let defaultWallet = store.getDefault();
 
+    // Auto-set default if there's exactly one wallet saved
+    if (!defaultWallet && wallets.length === 1) {
+      store.setDefault(wallets[0]);
+      defaultWallet = wallets[0];
+    }
+
+    // Auto-connect default wallet
     if (defaultWallet) {
       try {
         const walletPath = store.getWalletPath(defaultWallet);
         const info = this.tryConnectWallet(walletPath);
         if (info && this.walletManager.isConnected) {
-          console.log(chalk.green(`\n  Wallet loaded: ${info.address} (${defaultWallet})`));
-          return info;
+          console.log(chalk.green(`\n  Wallet connected: ${defaultWallet}`));
+          return { ...info, name: defaultWallet };
         }
       } catch {
-        console.log(chalk.dim(`\n  Default wallet "${defaultWallet}" not found.`));
+        console.log(chalk.dim(`\n  Wallet "${defaultWallet}" could not be loaded.`));
       }
     }
 
-    // No wallet available — show wallet menu
-    return this.showWalletMenu(store);
+    // Multiple wallets saved — pick by number
+    if (wallets.length > 1) {
+      return this.showWalletPicker(store, wallets);
+    }
+
+    // No wallets — first-time setup
+    return this.showFirstTimeWalletSetup(store);
   }
 
-  /**
-   * Wallet setup menu for live mode.
-   * No simulation fallback — user must resolve wallet or exit.
-   */
-  private async showWalletMenu(store: WalletStore): Promise<{ address: string } | null> {
-    const printOptions = (): void => {
-      console.log('');
-      console.log(chalk.yellow('  No wallet connected.'));
-      console.log('');
-      console.log(`    ${chalk.cyan('1)')} Import wallet`);
-      console.log(`    ${chalk.cyan('2)')} Connect wallet file`);
-      console.log(`    ${chalk.cyan('3)')} List saved wallets`);
-      console.log(`    ${chalk.cyan('4)')} Exit`);
-      console.log('');
-    };
+  /** Pick from multiple saved wallets by number. */
+  private async showWalletPicker(store: WalletStore, wallets: string[]): Promise<{ address: string; name: string } | null> {
+    console.log('');
+    console.log(chalk.bold('  Select wallet:'));
+    console.log('');
+    for (let i = 0; i < wallets.length; i++) {
+      console.log(`    ${chalk.cyan(String(i + 1) + ')')} ${wallets[i]}`);
+    }
+    console.log('');
+    console.log(`    ${chalk.cyan('0)')} Import new wallet`);
+    console.log(`    ${chalk.dim('q)')} Exit`);
+    console.log('');
 
-    printOptions();
+    while (true) {
+      const choice = (await this.ask(`  ${chalk.yellow('>')} `)).trim().toLowerCase();
+
+      if (choice === 'q') return null;
+
+      if (choice === '0') {
+        const importedName = await this.handleWalletImportFlow(store);
+        if (importedName) return { address: this.walletManager.address!, name: importedName };
+        continue;
+      }
+
+      const idx = parseInt(choice, 10) - 1;
+      if (idx >= 0 && idx < wallets.length) {
+        try {
+          const walletPath = store.getWalletPath(wallets[idx]);
+          const info = this.tryConnectWallet(walletPath);
+          if (info) {
+            store.setDefault(wallets[idx]);
+            console.log(chalk.green(`\n  Wallet connected: ${wallets[idx]}`));
+            return { ...info, name: wallets[idx] };
+          }
+        } catch (error: unknown) {
+          console.log(chalk.red(`  ${getErrorMessage(error)}`));
+        }
+      } else {
+        console.log(chalk.dim(`  Enter 1-${wallets.length}, 0, or q.`));
+      }
+    }
+  }
+
+  /** First-time wallet setup — no saved wallets. */
+  private async showFirstTimeWalletSetup(store: WalletStore): Promise<{ address: string; name: string } | null> {
+    console.log('');
+    console.log(chalk.bold('  Wallet Setup'));
+    console.log(chalk.dim('  A wallet is required for live trading.'));
+    console.log('');
+    console.log(`    ${chalk.cyan('1)')} Import wallet (paste private key)`);
+    console.log(`    ${chalk.cyan('2)')} Connect wallet file (JSON path)`);
+    console.log(`    ${chalk.cyan('3)')} Exit`);
+    console.log('');
 
     while (true) {
       const choice = (await this.ask(`  ${chalk.yellow('>')} `)).trim();
 
       switch (choice) {
         case '1': {
-          const result = await this.handleWalletImportFlow(store);
-          if (result) return { address: this.walletManager.address! };
-          printOptions();
+          const importedName = await this.handleWalletImportFlow(store);
+          if (importedName) return { address: this.walletManager.address!, name: importedName };
           continue;
         }
 
         case '2': {
-          const result = await this.handleWalletConnectFlow();
-          if (result) return { address: this.walletManager.address! };
-          printOptions();
+          const connected = await this.handleWalletConnectFlow();
+          if (connected) return { address: this.walletManager.address!, name: 'wallet' };
           continue;
         }
 
-        case '3': {
-          // List saved wallets and let user pick one
-          const wallets = store.listWallets();
-          if (wallets.length === 0) {
-            console.log(chalk.dim('\n  No saved wallets found.\n'));
-          } else {
-            console.log('');
-            console.log(chalk.bold('  Saved Wallets:'));
-            for (const name of wallets) {
-              try {
-                const addr = store.getAddress(name);
-                console.log(`    ${chalk.cyan(name)} → ${chalk.dim(shortAddress(addr))}`);
-              } catch {
-                console.log(`    ${chalk.cyan(name)} → ${chalk.red('(error reading)')}`);
-              }
-            }
-            console.log('');
-
-            const walletName = (await this.ask(`  ${chalk.yellow('Use wallet (name or Enter to cancel):')} `)).trim();
-            if (walletName) {
-              try {
-                const walletPath = store.getWalletPath(walletName);
-                const info = this.tryConnectWallet(walletPath);
-                if (info) {
-                  store.setDefault(walletName);
-                  return info;
-                }
-              } catch (error: unknown) {
-                console.log(chalk.red(`  ${getErrorMessage(error)}`));
-              }
-            }
-          }
-          printOptions();
-          continue;
-        }
-
-        case '4':
+        case '3':
           return null;
 
         default:
-          console.log(chalk.dim('  Enter 1, 2, 3, or 4.'));
+          console.log(chalk.dim('  Enter 1, 2, or 3.'));
           continue;
       }
     }
@@ -426,14 +444,14 @@ export class FlashTerminal {
     console.log('');
   }
 
-  private async showLiveBanner(address: string): Promise<void> {
+  private async showLiveBanner(walletName: string): Promise<void> {
     console.log('');
     console.log(chalk.red.bold('  ⚡ FLASH AI TERMINAL ⚡'));
     console.log(chalk.red('  ━━━━━━━━━━━━━━━━━━━━━━━━'));
     console.log('');
     console.log(chalk.bgRed.white.bold(' LIVE TRADING MODE '));
     console.log('');
-    console.log(`  Wallet:  ${chalk.cyan(address)}`);
+    console.log(`  Wallet:  ${chalk.cyan(walletName)}`);
     console.log(`  Network: ${chalk.bold(this.config.network)}`);
 
     try {
@@ -454,7 +472,7 @@ export class FlashTerminal {
 
   // ─── Intelligence Screen ─────────────────────────────────────────
 
-  private async showIntelligenceScreen(walletAddress: string | null): Promise<void> {
+  private async showIntelligenceScreen(walletName: string | null): Promise<void> {
     const isSim = this.config.simulationMode;
     const modeColor = isSim ? chalk.yellow : chalk.red;
     const modeLabel = isSim ? 'SIMULATION' : 'LIVE TRADING';
@@ -472,8 +490,8 @@ export class FlashTerminal {
     if (isSim) {
       console.log(`  Balance: ${chalk.green('$' + this.flashClient.getBalance().toFixed(2))}`);
       console.log(chalk.dim('  Trades are simulated. No real transactions.'));
-    } else if (walletAddress) {
-      console.log(`  Wallet:  ${chalk.cyan(walletAddress)}`);
+    } else if (walletName) {
+      console.log(`  Wallet:  ${chalk.cyan(walletName)}`);
       console.log(`  Network: ${chalk.bold(this.config.network)}`);
       try {
         const bal = await this.walletManager.getBalance();
@@ -681,18 +699,18 @@ export class FlashTerminal {
    * Interactive wallet import: prompts for name and private key array,
    * validates, stores to ~/.flash/wallets/, and connects.
    */
-  private async handleWalletImportFlow(store: WalletStore): Promise<boolean> {
+  private async handleWalletImportFlow(store: WalletStore): Promise<string | null> {
     console.log('');
 
     const name = (await this.ask(`  ${chalk.yellow('Enter wallet name:')} `)).trim();
     if (!name) {
       console.log(chalk.red('  Wallet name cannot be empty.'));
-      return false;
+      return null;
     }
 
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
       console.log(chalk.red('  Name must be 1-64 alphanumeric/hyphen/underscore characters.'));
-      return false;
+      return null;
     }
 
     console.log(chalk.dim('  Paste Solana private key (input hidden):'));
@@ -700,7 +718,7 @@ export class FlashTerminal {
 
     if (!keyInput) {
       console.log(chalk.red('  No key provided.'));
-      return false;
+      return null;
     }
 
     let secretKey: number[] | undefined;
@@ -708,12 +726,12 @@ export class FlashTerminal {
       const parsed: unknown = JSON.parse(keyInput);
       if (!Array.isArray(parsed)) {
         console.log(chalk.red('  Invalid key format. Expected JSON array of 64 numbers.'));
-        return false;
+        return null;
       }
       secretKey = parsed as number[];
     } catch {
       console.log(chalk.red('  Invalid key format. Expected JSON array of 64 numbers.'));
-      return false;
+      return null;
     }
 
     try {
@@ -724,14 +742,13 @@ export class FlashTerminal {
       this.walletManager.loadFromFile(result.path);
 
       console.log('');
-      console.log(chalk.green('  Wallet imported successfully'));
-      console.log(`  Address: ${chalk.cyan(result.address)}`);
+      console.log(chalk.green(`  Wallet "${name}" imported successfully`));
       console.log('');
 
-      return true;
+      return name;
     } catch (error: unknown) {
       console.log(chalk.red(`  Import failed: ${getErrorMessage(error)}`));
-      return false;
+      return null;
     } finally {
       if (secretKey) {
         secretKey.fill(0);
@@ -818,6 +835,7 @@ export class FlashTerminal {
       this.flashClient = new FlashClient(connection, this.walletManager, this.config);
       this.context.flashClient = this.flashClient;
       this.context.walletAddress = this.walletManager.address ?? 'unknown';
+      // walletName is preserved from initial setup
     } catch (error: unknown) {
       console.log(chalk.red(`  Failed to reinitialize live client: ${getErrorMessage(error)}`));
       console.log(chalk.dim('  Trading commands may fail until a wallet is reconnected.'));

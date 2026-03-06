@@ -47,6 +47,7 @@ export function loadConfig(): FlashConfig {
     pythnetUrl: process.env.PYTHNET_URL || 'https://pythnet.rpcpool.com',
     walletPath: resolveHome(process.env.WALLET_PATH || '~/.config/solana/id.json'),
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+    groqApiKey: process.env.GROQ_API_KEY || '',
     defaultPool: process.env.DEFAULT_POOL || 'Crypto.1',
     network: parseNetwork(process.env.NETWORK),
     simulationMode: process.env.SIMULATION_MODE !== 'false',

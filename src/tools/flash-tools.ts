@@ -719,6 +719,7 @@ export const walletImport: ToolDefinition = {
       if (wm) {
         wm.loadFromFile(result.path);
         context.walletAddress = result.address;
+        context.walletName = name;
       }
 
       const canSign = wm?.isConnected ?? false;
@@ -781,10 +782,8 @@ export const walletList: ToolDefinition = {
 
     for (const name of wallets) {
       const isDefault = name === defaultName;
-      const addr = walletStore.getAddress(name);
       const tag = isDefault ? chalk.green(' (default)') : '';
       lines.push(`  ${chalk.bold(name)}${tag}`);
-      lines.push(`    ${chalk.cyan(addr)}`);
     }
 
     lines.push('');
@@ -809,11 +808,11 @@ export const walletUse: ToolDefinition = {
       if (wm) {
         const result = wm.loadFromFile(walletPath);
         context.walletAddress = result.address;
+        context.walletName = name;
 
         const lines = [
           '',
           chalk.green(`  Switched to wallet: ${chalk.bold(name)}`),
-          `  Address: ${chalk.cyan(result.address)}`,
           '',
         ];
 
@@ -874,16 +873,13 @@ export const walletStatus: ToolDefinition = {
 
     if (wm && wm.isConnected) {
       lines.push(`  Connected: ${chalk.green('Yes')}`);
-      lines.push(`  Address:   ${chalk.cyan(wm.address)}`);
+      if (defaultName) {
+        lines.push(`  Wallet:    ${chalk.bold(defaultName)}`);
+      }
     } else if (wm && wm.hasAddress) {
       lines.push(`  Connected: ${chalk.yellow('Read-only')}`);
-      lines.push(`  Address:   ${chalk.cyan(wm.address)}`);
     } else {
       lines.push(`  Connected: ${chalk.red('No')}`);
-    }
-
-    if (defaultName) {
-      lines.push(`  Default:   ${chalk.bold(defaultName)}`);
     }
 
     lines.push(`  Stored:    ${storedCount} wallet(s)`);
@@ -911,6 +907,7 @@ export const walletDisconnect: ToolDefinition = {
     // Clear wallet from runtime
     wm.disconnect();
     context.walletAddress = 'unknown';
+    context.walletName = '';
 
     // Clear default so it won't auto-load next startup
     const config = walletStore.getDefault();
@@ -972,7 +969,6 @@ export const walletBalance: ToolDefinition = {
         '',
         chalk.bold('  Wallet Balance'),
         chalk.dim('  ─────────────────'),
-        `  Address: ${chalk.cyan(wm.address)}`,
         `  SOL:     ${chalk.green(sol.toFixed(4))} SOL`,
       ];
       for (const t of tokens) {
@@ -1069,13 +1065,13 @@ export const walletConnect: ToolDefinition = {
     try {
       const { address } = wm.loadFromFile(path);
       context.walletAddress = address;
+      context.walletName = 'wallet';
 
       const canSign = wm.isConnected;
       const lines = [
         '',
         chalk.green('  Wallet Connected'),
         chalk.dim('  ─────────────────'),
-        `  Address: ${chalk.cyan(address)}`,
         '',
       ];
 

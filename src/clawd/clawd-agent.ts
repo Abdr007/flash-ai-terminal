@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import {
   TradeSuggestion,
   TradeSide,
@@ -49,21 +50,42 @@ export interface SuggestTradeContext {
 }
 
 /**
- * Claude reasoning agent for trade suggestions.
- * Only used by the `suggest trade` command.
+ * AI reasoning agent for trade suggestions.
+ * Tries Anthropic first, then Groq, then strategy engine fallback.
  */
 export class ClawdAgent {
-  private client: Anthropic;
+  private anthropic: Anthropic | null;
+  private groq: OpenAI | null;
 
-  constructor(apiKey: string) {
-    this.client = new Anthropic({ apiKey });
+  constructor(apiKey: string, groqApiKey?: string) {
+    this.anthropic = apiKey ? new Anthropic({ apiKey }) : null;
+    this.groq = groqApiKey
+      ? new OpenAI({ apiKey: groqApiKey, baseURL: 'https://api.groq.com/openai/v1' })
+      : null;
   }
 
   async suggestTrade(context: SuggestTradeContext): Promise<TradeSuggestion | null> {
     const logger = getLogger();
-
     const userMessage = this.buildPrompt(context);
 
+    // Try Anthropic first
+    if (this.anthropic) {
+      const result = await this.tryAnthropic(userMessage);
+      if (result) return result;
+    }
+
+    // Try Groq as fallback
+    if (this.groq) {
+      const result = await this.tryGroq(userMessage);
+      if (result) return result;
+    }
+
+    // Final fallback: strategy engine
+    return this.fallback(context);
+  }
+
+  private async tryAnthropic(userMessage: string): Promise<TradeSuggestion | null> {
+    const logger = getLogger();
     try {
       logger.debug('CLAWD', 'Requesting trade suggestion from Claude');
 
@@ -72,7 +94,7 @@ export class ClawdAgent {
 
       let response;
       try {
-        response = await this.client.messages.create({
+        response = await this.anthropic!.messages.create({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 512,
           system: SYSTEM_PROMPT,
@@ -83,20 +105,61 @@ export class ClawdAgent {
       }
 
       if (response.content.length === 0 || response.content[0].type !== 'text') {
-        logger.warn('CLAWD', 'Empty response from Claude, falling back to strategy engine');
-        return this.fallback(context);
+        logger.warn('CLAWD', 'Empty response from Claude');
+        return null;
       }
 
-      const text = response.content[0].text;
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        logger.warn('CLAWD', 'No JSON in Claude response, falling back to strategy engine');
-        return this.fallback(context);
+      return this.parseSuggestion(response.content[0].text, 'Claude');
+    } catch (error: unknown) {
+      const msg = getErrorMessage(error);
+      if (msg.includes('credit balance') || msg.includes('401') || msg.includes('403') || msg.includes('429')) {
+        logger.warn('CLAWD', `Claude unavailable: ${msg}. Trying fallback...`);
+      } else {
+        logger.error('CLAWD', `Claude failed: ${msg}`);
+      }
+      return null;
+    }
+  }
+
+  private async tryGroq(userMessage: string): Promise<TradeSuggestion | null> {
+    const logger = getLogger();
+    try {
+      logger.debug('CLAWD', 'Requesting trade suggestion from Groq');
+
+      const response = await this.groq!.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 512,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0,
+      });
+
+      const text = response.choices[0]?.message?.content;
+      if (!text) {
+        logger.warn('CLAWD', 'Empty response from Groq');
+        return null;
       }
 
+      return this.parseSuggestion(text, 'Groq');
+    } catch (error: unknown) {
+      logger.warn('CLAWD', `Groq failed: ${getErrorMessage(error)}`);
+      return null;
+    }
+  }
+
+  private parseSuggestion(text: string, source: string): TradeSuggestion | null {
+    const logger = getLogger();
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      logger.warn('CLAWD', `No JSON in ${source} response`);
+      return null;
+    }
+
+    try {
       const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
 
-      // Validate and clamp values
       const suggestion: TradeSuggestion = {
         market: String(parsed.market ?? 'SOL').toUpperCase(),
         side: parsed.side === 'short' ? TradeSide.Short : TradeSide.Long,
@@ -107,21 +170,15 @@ export class ClawdAgent {
         risks: Array.isArray(parsed.risks) ? parsed.risks.map(String) : ['Market volatility', 'Liquidation risk'],
       };
 
-      // Ensure at least 2 risks
       while (suggestion.risks.length < 2) {
         suggestion.risks.push('General market risk');
       }
 
-      logger.debug('CLAWD', `Trade suggestion: ${suggestion.side} ${suggestion.market} ${suggestion.leverage}x`);
+      logger.debug('CLAWD', `${source} suggestion: ${suggestion.side} ${suggestion.market} ${suggestion.leverage}x`);
       return suggestion;
     } catch (error: unknown) {
-      const msg = getErrorMessage(error);
-      if (msg.includes('credit balance') || msg.includes('401') || msg.includes('403') || msg.includes('429')) {
-        logger.warn('CLAWD', `Claude API unavailable: ${msg}. Falling back to strategy engine.`);
-      } else {
-        logger.error('CLAWD', `Suggest trade failed: ${msg}. Falling back to strategy engine.`);
-      }
-      return this.fallback(context);
+      logger.warn('CLAWD', `${source} JSON parse failed: ${getErrorMessage(error)}`);
+      return null;
     }
   }
 
