@@ -351,7 +351,7 @@ export const flashGetPositions: ToolDefinition = {
   execute: async (_params, context): Promise<ToolResult> => {
     const positions = await context.flashClient.getPositions();
     if (positions.length === 0) {
-      return { success: true, message: chalk.dim('  No open positions') };
+      return { success: true, message: chalk.dim('\n  No open positions.\n') };
     }
 
     const headers = ['Market', 'Side', 'Leverage', 'Size', 'Collateral', 'PnL', 'Liq Price'];
@@ -385,7 +385,7 @@ export const flashGetMarketData: ToolDefinition = {
     const { market } = params as { market?: string };
     const markets = await context.flashClient.getMarketData(market);
     if (markets.length === 0) {
-      return { success: true, message: chalk.dim('  No market data available') };
+      return { success: true, message: chalk.dim('\n  Market data unavailable. Try again later.\n') };
     }
 
     // Enrich with fstats OI data and CoinGecko 24h change
@@ -438,19 +438,41 @@ export const flashGetPortfolio: ToolDefinition = {
   execute: async (_params, context): Promise<ToolResult> => {
     const portfolio = await context.flashClient.getPortfolio();
 
+    // Compute directional bias
+    let longExposure = 0;
+    let shortExposure = 0;
+    for (const p of portfolio.positions) {
+      if (p.side === TradeSide.Long) longExposure += p.sizeUsd;
+      else shortExposure += p.sizeUsd;
+    }
+    const totalExposure = longExposure + shortExposure;
+    const longPct = totalExposure > 0 ? ((longExposure / totalExposure) * 100).toFixed(0) : '0';
+    const shortPct = totalExposure > 0 ? ((shortExposure / totalExposure) * 100).toFixed(0) : '0';
+
     const lines = [
       '',
       chalk.bold('  Portfolio Summary'),
-      chalk.dim('  ─────────────────────'),
-      `  Wallet:         ${shortAddress(portfolio.walletAddress)}`,
-      `  ${portfolio.balanceLabel}`,
-      portfolio.usdcBalance !== undefined ? `  USDC Available: ${chalk.green('$' + portfolio.usdcBalance.toFixed(2))}` : '',
-      `  Collateral:     ${formatUsd(portfolio.totalCollateralUsd)}`,
-      `  Position Value: ${formatUsd(portfolio.totalPositionValue)}`,
-      `  Unrealized PnL: ${colorPnl(portfolio.totalUnrealizedPnl)}`,
-      `  Positions:      ${portfolio.positions.length}`,
+      chalk.dim('  ─────────────────────────────────────────'),
+      '',
+      `  Total Positions:  ${portfolio.positions.length}`,
+      `  Total Exposure:   ${formatUsd(totalExposure)}`,
       '',
     ];
+
+    if (portfolio.positions.length > 0) {
+      lines.push(chalk.bold('  Directional Bias'));
+      lines.push(`  LONG:  ${longPct}%`);
+      lines.push(`  SHORT: ${shortPct}%`);
+      lines.push('');
+    }
+
+    lines.push(
+      `  ${portfolio.balanceLabel}`,
+      portfolio.usdcBalance !== undefined ? `  USDC Available:   ${chalk.green('$' + portfolio.usdcBalance.toFixed(2))}` : '',
+      `  Collateral:       ${formatUsd(portfolio.totalCollateralUsd)}`,
+      `  Unrealized PnL:   ${colorPnl(portfolio.totalUnrealizedPnl)}`,
+      '',
+    );
 
     return {
       success: true,
@@ -476,7 +498,7 @@ export const flashGetVolume: ToolDefinition = {
 
       const recent = volume.dailyVolumes.slice(-7);
       if (recent.length === 0) {
-        return { success: true, message: chalk.dim('  No volume data available. Try again later.') };
+        return { success: true, message: chalk.dim('\n  Volume data unavailable.\n') };
       }
 
       const headers = ['Date', 'Volume', 'Trades', 'Long', 'Short'];
@@ -503,7 +525,7 @@ export const flashGetVolume: ToolDefinition = {
         data: { volume },
       };
     } catch (error: unknown) {
-      return { success: false, message: chalk.red(`  Unable to fetch volume data. Try again later. (${getErrorMessage(error)})`) };
+      return { success: false, message: chalk.dim(`\n  Volume data unavailable.\n`) };
     }
   },
 };
@@ -517,7 +539,7 @@ export const flashGetOpenInterest: ToolDefinition = {
       const oi = await context.dataClient.getOpenInterest();
 
       if (oi.markets.length === 0) {
-        return { success: true, message: chalk.dim('  No OI data available') };
+        return { success: true, message: chalk.dim('\n  Open interest data unavailable.\n') };
       }
 
       const headers = ['Market', 'Long OI', 'Short OI', 'L Positions', 'S Positions'];
@@ -535,7 +557,7 @@ export const flashGetOpenInterest: ToolDefinition = {
         data: { openInterest: oi },
       };
     } catch (error: unknown) {
-      return { success: false, message: chalk.red(`  Unable to fetch open interest data. Try again later. (${getErrorMessage(error)})`) };
+      return { success: false, message: chalk.dim(`\n  Open interest data unavailable.\n`) };
     }
   },
 };
@@ -562,7 +584,7 @@ export const flashGetLeaderboard: ToolDefinition = {
       const entries = await context.dataClient.getLeaderboard(metric, days, limit);
 
       if (entries.length === 0) {
-        return { success: true, message: chalk.dim('  No leaderboard data available. Try again later.') };
+        return { success: true, message: chalk.dim('\n  Leaderboard data unavailable.\n') };
       }
 
       const headers = ['#', 'Trader', 'PnL', 'Volume', 'Trades', 'Win Rate'];
@@ -587,7 +609,7 @@ export const flashGetLeaderboard: ToolDefinition = {
         data: { leaderboard: entries },
       };
     } catch (error: unknown) {
-      return { success: false, message: chalk.red(`  Unable to fetch leaderboard. Try again later. (${getErrorMessage(error)})`) };
+      return { success: false, message: chalk.dim(`\n  Leaderboard data unavailable.\n`) };
     }
   },
 };
@@ -616,7 +638,7 @@ export const flashGetFees: ToolDefinition = {
         data: { fees },
       };
     } catch (error: unknown) {
-      return { success: false, message: chalk.red(`  Unable to fetch fee data. Try again later. (${getErrorMessage(error)})`) };
+      return { success: false, message: chalk.dim(`\n  Fee data unavailable.\n`) };
     }
   },
 };
@@ -651,7 +673,9 @@ export const flashGetTraderProfile: ToolDefinition = {
 // ─── Wallet Tools ───────────────────────────────────────────────────────────
 
 import { WalletStore } from '../wallet/wallet-store.js';
-import { readFileSync } from 'fs';
+import { readFileSync, realpathSync } from 'fs';
+import { resolve } from 'path';
+import { homedir } from 'os';
 
 const walletStore = new WalletStore();
 
@@ -666,7 +690,24 @@ export const walletImport: ToolDefinition = {
     const { name, path } = params as { name: string; path: string };
     let secretKey: number[] | undefined;
     try {
-      const raw = readFileSync(path, 'utf-8');
+      // Path validation: restrict to home directory, resolve symlinks
+      const resolvedPath = resolve(path);
+      const home = homedir();
+      const homePrefix = home.endsWith('/') ? home : home + '/';
+      if (resolvedPath !== home && !resolvedPath.startsWith(homePrefix)) {
+        return { success: false, message: chalk.red(`  Wallet path must be within home directory (${home}).`) };
+      }
+      let realPath: string;
+      try {
+        realPath = realpathSync(resolvedPath);
+      } catch {
+        return { success: false, message: chalk.red(`  Wallet file not found: ${resolvedPath}`) };
+      }
+      if (realPath !== home && !realPath.startsWith(homePrefix)) {
+        return { success: false, message: chalk.red('  Wallet path resolves outside home directory (symlink?).') };
+      }
+
+      const raw = readFileSync(realPath, 'utf-8');
       secretKey = JSON.parse(raw);
       const result = walletStore.importWallet(name, secretKey!);
 
@@ -877,19 +918,20 @@ export const walletDisconnect: ToolDefinition = {
       walletStore.clearDefault();
     }
 
-    const wasLive = !context.simulationMode;
+    const isLive = !context.simulationMode;
 
     const lines = [
       '',
-      chalk.green('  Wallet disconnected successfully.'),
-      '',
+      chalk.green('  Wallet disconnected.'),
     ];
 
-    if (wasLive) {
-      lines.push(chalk.yellow('  Live wallet disconnected.'));
-      lines.push(chalk.yellow('  Switching to simulation mode.'));
+    if (isLive) {
       lines.push('');
+      lines.push(chalk.yellow('  Live trading disabled until a wallet is connected.'));
+      lines.push(chalk.dim('  Use "wallet import", "wallet use", or "wallet connect" to reconnect.'));
     }
+
+    lines.push('');
 
     return {
       success: true,
@@ -1008,6 +1050,18 @@ export const walletConnect: ToolDefinition = {
   }),
   execute: async (params, context): Promise<ToolResult> => {
     const { path } = params as { path: string };
+    if (!path) {
+      return {
+        success: false,
+        message: [
+          chalk.red('  Missing path. Usage:'),
+          '',
+          `    ${chalk.cyan('wallet connect <path>')}`,
+          '',
+          chalk.dim('  Example: wallet connect ~/.config/solana/id.json'),
+        ].join('\n'),
+      };
+    }
     const wm = context.walletManager;
     if (!wm) {
       return { success: false, message: chalk.red('  Wallet manager not available') };

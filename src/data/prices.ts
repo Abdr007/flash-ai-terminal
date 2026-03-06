@@ -25,6 +25,10 @@ const COINGECKO_IDS: Record<string, string> = {
   PENGU: 'pudgy-penguins',
   ORE: 'ore',
   HYPE: 'hyperliquid',
+  FARTCOIN: 'fartcoin',
+  KMNO: 'kamino',
+  MET: 'metaplex',
+  PUMP: 'pump-fun',
 };
 
 // SECURITY: No hardcoded fallback prices. If CoinGecko fails, the market is

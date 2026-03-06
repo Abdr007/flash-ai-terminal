@@ -75,8 +75,7 @@ export class Autopilot {
       return [
         '',
         chalk.red('  Autopilot disabled in LIVE mode.'),
-        chalk.yellow('  Run terminal with: flash --sim'),
-        chalk.dim('  to test automated trading.'),
+        chalk.dim('  Restart terminal and select Simulation to use autopilot.'),
         '',
       ].join('\n');
     }
@@ -155,7 +154,8 @@ export class Autopilot {
   getStatus(): string {
     const lines = [
       '',
-      chalk.bold.cyan('  ═══ Autopilot Status ═══'),
+      chalk.bold('  Autopilot Status'),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
       `  Status:     ${this.state.active ? chalk.green.bold('ACTIVE') : chalk.gray('INACTIVE')}`,
     ];

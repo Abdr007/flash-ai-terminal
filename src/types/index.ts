@@ -62,7 +62,7 @@ export const OpenPositionSchema = z.object({
   market: z.string(),
   side: z.nativeEnum(TradeSide),
   collateral: z.number().positive(),
-  leverage: z.number().min(1).max(500),
+  leverage: z.number().min(1).max(100),
   collateral_token: z.string().optional(),
 });
 

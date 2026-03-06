@@ -92,7 +92,7 @@ export const POOL_MARKETS: Record<string, string[]> = {
 export function getPoolForMarket(symbol: string): string | null {
   const upper = symbol.toUpperCase();
   for (const [pool, markets] of Object.entries(POOL_MARKETS)) {
-    if (markets.includes(upper)) {
+    if (markets.some((m) => m.toUpperCase() === upper)) {
       return pool;
     }
   }
@@ -100,5 +100,5 @@ export function getPoolForMarket(symbol: string): string | null {
 }
 
 export function getAllMarkets(): string[] {
-  return Object.values(POOL_MARKETS).flat();
+  return Object.values(POOL_MARKETS).flat().map((m) => m.toUpperCase());
 }

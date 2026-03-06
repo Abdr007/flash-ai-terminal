@@ -4,7 +4,6 @@ import { Command } from 'commander';
 import { loadConfig } from './config/index.js';
 import { FlashTerminal } from './cli/terminal.js';
 import { getErrorMessage } from './utils/retry.js';
-import { getLogger } from './utils/logger.js';
 import chalk from 'chalk';
 
 // Global error handlers
@@ -12,28 +11,6 @@ process.on('unhandledRejection', (reason) => {
   console.error(chalk.red(`\n  Unhandled error: ${getErrorMessage(reason)}\n`));
   process.exit(1);
 });
-
-// Safe shutdown: stop autopilot before exiting
-// Import at top level — safe since clawd-tools has no circular dependency with index
-import { getAutopilotIfExists } from './clawd/clawd-tools.js';
-
-function gracefulShutdown(signal: string): void {
-  console.log(chalk.dim(`\n  Shutting down (${signal})...`));
-  try {
-    const autopilot = getAutopilotIfExists();
-    if (autopilot?.state?.active) {
-      autopilot.stop();
-      getLogger().info('SHUTDOWN', `Autopilot stopped via ${signal}`);
-    }
-  } catch {
-    // Best-effort cleanup — don't block exit
-  }
-  console.log(chalk.dim('  Goodbye.\n'));
-  process.exit(0);
-}
-
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 const program = new Command();
 
@@ -46,29 +23,10 @@ program
 program
   .command('start', { isDefault: true })
   .description('Start the interactive Flash AI Terminal')
-  .option('--sim', 'Run in simulation mode (default)')
-  .option('--live', 'Run in live trading mode (real transactions)')
   .option('-p, --pool <name>', 'Default pool name')
   .option('--rpc <url>', 'Solana RPC URL')
-  .action(async (opts: { live?: boolean; sim?: boolean; pool?: string; rpc?: string }) => {
-    // Conflicting flags guard
-    if (opts.sim && opts.live) {
-      console.error(chalk.red('\n  Cannot run both --sim and --live modes.\n'));
-      console.log(chalk.dim('  Usage:'));
-      console.log(chalk.dim('    flash --sim     Simulation mode (paper trading)'));
-      console.log(chalk.dim('    flash --live    Live trading mode (real transactions)\n'));
-      process.exit(1);
-    }
-
+  .action(async (opts: { pool?: string; rpc?: string }) => {
     const config = loadConfig();
-
-    // CLI flags override env var. Default to simulation for safety.
-    if (opts.live) {
-      config.simulationMode = false;
-    } else if (opts.sim) {
-      config.simulationMode = true;
-    }
-    // If neither flag: keep config.simulationMode from loadConfig() (defaults to true)
 
     if (opts.pool) config.defaultPool = opts.pool;
     if (opts.rpc) config.rpcUrl = opts.rpc;

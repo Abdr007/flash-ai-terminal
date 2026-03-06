@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, existsSync, writeFileSync, chmodSync } from 'fs';
+import { appendFile, mkdirSync, existsSync, writeFileSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import chalk from 'chalk';
 
@@ -117,11 +117,9 @@ export class Logger {
     if (!this.logFilePath) return;
     const dataStr = entry.data ? ` ${JSON.stringify(entry.data)}` : '';
     const line = `[${entry.timestamp}] ${LEVEL_LABELS[entry.level]} [${entry.category}] ${entry.message}${dataStr}\n`;
-    try {
-      appendFileSync(this.logFilePath, line);
-    } catch {
-      // Silently fail file writes to avoid crashing the CLI
-    }
+    appendFile(this.logFilePath, line, () => {
+      // Fire-and-forget — silently ignore write errors to avoid crashing the CLI
+    });
   }
 
   private writeToConsole(entry: LogEntry): void {

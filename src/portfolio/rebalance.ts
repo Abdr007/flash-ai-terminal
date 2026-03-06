@@ -120,7 +120,7 @@ export function analyzeRebalance(
           type: 'reduce_collateral',
           market: target.market,
           side: target.side,
-          amount: Math.round(Math.max(10, reductionTarget / target.leverage)),
+          amount: Math.round(Math.max(10, target.leverage > 0 ? reductionTarget / target.leverage : reductionTarget)),
           reason: `${market} concentration ${(pct * 100).toFixed(0)}%: reduce by ~$${Math.round(reductionTarget)}`,
         });
       }

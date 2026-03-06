@@ -30,6 +30,8 @@ Available actions:
 - wallet_status: Show wallet connection status
 - wallet_address: Show connected wallet address
 - wallet_balance: Show wallet SOL balance
+- wallet_tokens: Show all token balances in the wallet
+- flash_markets: List all available trading markets
 - help: Show help
 - analyze: Analyze a market with strategy signals
 - suggest_trade: Get AI trade suggestion
@@ -134,6 +136,10 @@ export function localParse(input: string): ParsedIntent | null {
   const walletConnectMatch = lower.match(/^wallet\s+connect\s+(.+)$/);
   if (walletConnectMatch) {
     return { action: ActionType.WalletConnect, path: walletConnectMatch[1].trim() };
+  }
+  // Bare "wallet connect" without path — still route to connect tool with empty path so it shows usage
+  if (/^wallet\s+connect$/.test(lower)) {
+    return { action: ActionType.WalletConnect, path: '' };
   }
   if (/^wallet\s+(address|addr)$/.test(lower)) {
     return { action: ActionType.WalletAddress };

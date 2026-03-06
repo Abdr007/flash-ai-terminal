@@ -10,17 +10,19 @@ import { SimulatedFlashClient } from '../client/simulation.js';
 import { FStatsClient } from '../data/fstats.js';
 import { WalletManager, createConnection } from '../wallet/index.js';
 import { WalletStore } from '../wallet/wallet-store.js';
-import { banner, shortAddress } from '../utils/format.js';
+import { shortAddress } from '../utils/format.js';
 import { getErrorMessage } from '../utils/retry.js';
 import { initLogger } from '../utils/logger.js';
-import { getAutopilot, setClawdApiKey } from '../clawd/clawd-tools.js';
+import { getAutopilot, setClawdApiKey, getInspector, getScanner, getRegimeDetector } from '../clawd/clawd-tools.js';
+import { formatUsd, colorPercent } from '../utils/format.js';
+import { MarketRegime } from '../regime/regime-types.js';
 
-const COMMAND_TIMEOUT_MS = 10_000;
-const SLOW_COMMAND_MS = 2_000;
+const COMMAND_TIMEOUT_MS = 30_000;
+const SLOW_COMMAND_MS = 3_000;
 const HISTORY_FILE = join(homedir(), '.flash_terminal_history');
 const MAX_HISTORY = 1000;
 
-/** Phase 11: Single-token fast dispatch — skips interpreter entirely */
+/** Single-token fast dispatch — skips interpreter entirely */
 const FAST_DISPATCH: Record<string, ParsedIntent> = {
   'help':        { action: ActionType.Help },
   'commands':    { action: ActionType.Help },
@@ -56,9 +58,17 @@ const FAST_DISPATCH: Record<string, ParsedIntent> = {
   'wallet address':  { action: ActionType.WalletAddress },
   'wallet balance':  { action: ActionType.WalletBalance },
   'wallet disconnect': { action: ActionType.WalletDisconnect },
+  'open interest':     { action: ActionType.GetOpenInterest },
+  'oi':                { action: ActionType.GetOpenInterest },
+  'whales':            { action: ActionType.WhaleActivity },
+  'autopilot':         { action: ActionType.AutopilotStatus },
+  'portfolio state':   { action: ActionType.PortfolioState },
+  'portfolio exposure': { action: ActionType.PortfolioExposure },
+  'portfolio rebalance': { action: ActionType.PortfolioRebalance },
+  'capital':           { action: ActionType.PortfolioState },
 };
 
-/** Phase 3: Timeout wrapper for command execution */
+/** Timeout wrapper for command execution */
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(
@@ -72,6 +82,20 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+interface IntelligenceData {
+  marketCount: number;
+  positionCount: number;
+  portfolioBalance: number;
+  totalPnl: number;
+  dominantRegime?: string;
+  opportunities?: {
+    market: string;
+    direction: string;
+    confidence: number;
+    regime?: string;
+  }[];
+}
+
 export class FlashTerminal {
   private config: FlashConfig;
   private interpreter: AIInterpreter | OfflineInterpreter;
@@ -81,9 +105,11 @@ export class FlashTerminal {
   private flashClient!: IFlashClient;
   private fstats: FStatsClient;
   private walletManager: WalletManager;
-  /** Phase 8: Confirmation callback for the next line input */
+  /** Mode is locked for the entire session once selected */
+  private modeLocked = false;
+  /** Confirmation callback for the next line input */
   private pendingConfirmation: ((answer: string) => void) | null = null;
-  /** Phase 8: Prevent concurrent command processing */
+  /** Prevent concurrent command processing */
   private processing = false;
 
   constructor(config: FlashConfig) {
@@ -102,10 +128,7 @@ export class FlashTerminal {
   }
 
   async start(): Promise<void> {
-    // Phase 10: Startup safety checks
-    this.validateStartup();
-
-    // Create readline early — needed for wallet prompt
+    // Create readline early — needed for prompts
     this.rl = createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -114,76 +137,45 @@ export class FlashTerminal {
 
     this.loadHistory();
 
-    // Print banner (mode determined after config is loaded)
-    console.log(banner(this.config.simulationMode));
+    // ─── Welcome Screen & Mode Selection ──────────────────────────────
+    const mode = await this.showModeSelection();
 
-    // ─── Auto-Load Default Wallet ──────────────────────────────────────
-    let walletInfo: { address: string } | null = null;
-    const store = new WalletStore();
-    const defaultWallet = store.getDefault();
-
-    if (defaultWallet) {
-      try {
-        const walletPath = store.getWalletPath(defaultWallet);
-        walletInfo = this.tryConnectWallet(walletPath);
-        if (walletInfo) {
-          console.log(chalk.green(`\n  Wallet: ${walletInfo.address} (${defaultWallet})`));
-        }
-      } catch {
-        console.log(chalk.dim(`\n  Default wallet "${defaultWallet}" not found.`));
-      }
+    if (mode === 'exit') {
+      console.log(chalk.dim('\n  Goodbye.\n'));
+      this.rl.close();
+      process.exit(0);
     }
 
-    // ─── Live Mode Wallet Gate ──────────────────────────────────────────
-    // If live mode was requested but no wallet is connected, pause and ask.
-    // Never silently switch to simulation.
-    const isLiveRequested = !this.config.simulationMode;
-    const canSign = this.walletManager.isConnected;
+    this.config.simulationMode = mode === 'simulation';
+    this.modeLocked = true;
 
-    if (isLiveRequested && (!walletInfo || !canSign)) {
-      const choice = await this.showLiveWalletMenu(store);
+    // ─── Mode-Specific Setup ──────────────────────────────────────────
+    let walletInfo: { address: string } | null = null;
 
-      if (choice === 'exit') {
+    if (mode === 'live') {
+      walletInfo = await this.setupLiveMode();
+      if (!walletInfo) {
+        // User chose exit from wallet menu
         console.log(chalk.dim('\n  Goodbye.\n'));
         this.rl.close();
         process.exit(0);
       }
-
-      if (choice === 'simulation') {
-        this.config.simulationMode = true;
-      }
-
-      // Re-check after wallet setup
-      walletInfo = this.walletManager.isConnected
-        ? { address: this.walletManager.address! }
-        : walletInfo;
     }
 
-    if (!walletInfo && this.config.simulationMode) {
-      console.log(chalk.dim('\n  No wallet connected. Use: wallet import <name> <path>'));
-    }
-
-    // ─── Initialize Client ───────────────────────────────────────────────
+    // ─── Initialize Client ───────────────────────────────────────────
     const connection = createConnection(this.config.rpcUrl);
 
     if (this.config.simulationMode) {
-      this.flashClient = new SimulatedFlashClient(10_000);
-    } else if (!this.walletManager.isConnected) {
-      // Should not reach here — the gate above ensures wallet or simulation.
-      // Defensive fallback.
-      console.log(chalk.red('  No wallet available for live trading.'));
-      console.log(chalk.yellow('  Switching to simulation mode.'));
-      this.config.simulationMode = true;
       this.flashClient = new SimulatedFlashClient(10_000);
     } else {
       try {
         const { FlashClient } = await import('../client/flash-client.js');
         this.flashClient = new FlashClient(connection, this.walletManager, this.config);
       } catch (error: unknown) {
-        console.log(chalk.red(`  Failed to initialize live client: ${getErrorMessage(error)}`));
-        console.log(chalk.yellow('  Switching to simulation mode.'));
-        this.config.simulationMode = true;
-        this.flashClient = new SimulatedFlashClient(10_000);
+        console.log(chalk.red(`\n  Failed to initialize live client: ${getErrorMessage(error)}`));
+        console.log(chalk.dim('  Please check your RPC connection and try again.\n'));
+        this.rl.close();
+        process.exit(1);
       }
     }
 
@@ -202,42 +194,14 @@ export class FlashTerminal {
     // Set prompt based on mode
     this.updatePrompt();
 
-    // ─── Display Status ──────────────────────────────────────────────────
-    console.log('');
-    if (this.config.simulationMode) {
-      const modeTag = chalk.bgYellow.black(' SIMULATION ');
-      console.log(`  ${modeTag} ${chalk.dim('Pool:')} ${chalk.bold(this.config.defaultPool)}`);
+    // ─── Display Intelligence Screen ─────────────────────────────────
+    await this.showIntelligenceScreen(walletInfo?.address ?? null);
 
-      if (walletInfo) {
-        console.log(`  Wallet: ${chalk.cyan(walletInfo.address)}`);
-      } else {
-        console.log(`  Wallet: ${chalk.cyan(shortAddress(this.context.walletAddress))}`);
-      }
-
-      console.log(`  Balance: ${chalk.green('$' + this.flashClient.getBalance().toFixed(2))}`);
-    } else {
-      const modeTag = chalk.bgRed.white.bold(' LIVE TRADING ENABLED ');
-      console.log(`  ${modeTag}`);
-      console.log('');
-      console.log(`  Wallet:  ${chalk.cyan(walletInfo!.address)}`);
-      console.log(`  Network: ${chalk.bold(this.config.network)}`);
-      console.log(`  Pool:    ${chalk.bold(this.config.defaultPool)}`);
-
-      try {
-        const bal = await this.walletManager.getBalance();
-        console.log(`  Balance: ${chalk.green(bal.toFixed(4))} SOL`);
-      } catch {
-        // silently ignore balance fetch errors at startup
-      }
-    }
-
-    console.log(chalk.dim('\n  Type "help" for commands, "exit" to quit.\n'));
-
-    // ─── Signal Handlers ──────────────────────────────────────────────────
+    // ─── Signal Handlers ──────────────────────────────────────────────
     process.on('SIGINT', () => this.shutdown());
     process.on('SIGTERM', () => this.shutdown());
 
-    // ─── Start Line Handler ──────────────────────────────────────────────
+    // ─── Start Line Handler ───────────────────────────────────────────
     this.rl.on('close', () => {
       this.shutdown();
     });
@@ -288,105 +252,97 @@ export class FlashTerminal {
     this.rl.prompt();
   }
 
-  /** Try to connect a wallet from a file path. Returns info on success, null on failure. */
-  private tryConnectWallet(path: string): { address: string } | null {
-    try {
-      const result = this.walletManager.loadFromFile(path);
-      console.log(chalk.green(`  Connected: ${result.address}`));
-      return { address: result.address };
-    } catch (error: unknown) {
-      console.log(chalk.red(`  Failed to load wallet: ${getErrorMessage(error)}`));
-      return null;
+  // ─── Welcome Screen ────────────────────────────────────────────────
+
+  private async showModeSelection(): Promise<'live' | 'simulation' | 'exit'> {
+    console.log('');
+    console.log(chalk.yellow.bold('  ⚡ FLASH AI TERMINAL ⚡'));
+    console.log(chalk.yellow('  ━━━━━━━━━━━━━━━━━━━━━━━━'));
+    console.log('');
+    console.log(chalk.dim('  AI Trading Interface for Flash Trade'));
+    console.log('');
+    console.log(chalk.dim('  This terminal provides real-time market intelligence'));
+    console.log(chalk.dim('  and trading tools using live blockchain data.'));
+    console.log('');
+    console.log(chalk.bold('  Modes Available'));
+    console.log('');
+    console.log(`    ${chalk.cyan('1)')} ${chalk.bold('LIVE TRADING')}`);
+    console.log(chalk.dim('       Execute real transactions on Flash Trade.'));
+    console.log('');
+    console.log(`    ${chalk.cyan('2)')} ${chalk.bold('SIMULATION')}`);
+    console.log(chalk.dim('       Test strategies using paper trading.'));
+    console.log('');
+    console.log(chalk.dim('  All market data shown in this terminal is real-time.'));
+    console.log(chalk.dim('  No synthetic or fabricated values are used.'));
+    console.log('');
+    console.log(chalk.bold('  Select mode:'));
+    console.log('');
+    console.log(`    ${chalk.cyan('1')} → Live Trading`);
+    console.log(`    ${chalk.cyan('2')} → Simulation`);
+    console.log(`    ${chalk.cyan('3')} → Exit`);
+    console.log('');
+
+    while (true) {
+      const choice = (await this.ask(`  ${chalk.yellow('>')} `)).trim();
+
+      switch (choice) {
+        case '1':
+          return 'live';
+        case '2':
+          return 'simulation';
+        case '3':
+          return 'exit';
+        default:
+          console.log(chalk.dim('  Enter 1, 2, or 3.'));
+          continue;
+      }
     }
   }
 
-  /** Blocking question prompt for startup flows. */
-  private ask(question: string): Promise<string> {
-    return new Promise((resolve) => {
-      this.rl.question(question, resolve);
-    });
-  }
+  // ─── Live Mode Setup ───────────────────────────────────────────────
 
   /**
-   * Read a line of input with echo disabled.
-   * Used for private key entry — input is never displayed on screen.
+   * Set up live mode: ensure a wallet is connected.
+   * Returns wallet info on success, null if user chose exit.
    */
-  private readHidden(prompt: string): Promise<string> {
-    return new Promise((resolve) => {
-      const stdin = process.stdin;
-      const stdout = process.stdout;
+  private async setupLiveMode(): Promise<{ address: string } | null> {
+    // Try auto-loading default wallet first
+    const store = new WalletStore();
+    const defaultWallet = store.getDefault();
 
-      stdout.write(prompt);
-
-      // Pause readline so it doesn't intercept raw keystrokes
-      this.rl.pause();
-
-      const wasRaw = stdin.isRaw ?? false;
-      stdin.setRawMode(true);
-      stdin.resume();
-      stdin.setEncoding('utf8');
-
-      let input = '';
-
-      const onData = (ch: string): void => {
-        const char = ch.toString();
-
-        switch (char) {
-          case '\n':
-          case '\r':
-          case '\u0004': // Ctrl+D
-            stdin.setRawMode(wasRaw);
-            stdin.removeListener('data', onData);
-            stdout.write('\n');
-            this.rl.resume();
-            resolve(input.trim());
-            return;
-
-          case '\u0003': // Ctrl+C
-            stdin.setRawMode(wasRaw);
-            stdin.removeListener('data', onData);
-            stdout.write('\n');
-            this.rl.resume();
-            resolve('');
-            return;
-
-          case '\u007F': // Backspace
-          case '\b':
-            if (input.length > 0) {
-              input = input.slice(0, -1);
-            }
-            return;
-
-          default:
-            input += char;
-            return;
+    if (defaultWallet) {
+      try {
+        const walletPath = store.getWalletPath(defaultWallet);
+        const info = this.tryConnectWallet(walletPath);
+        if (info && this.walletManager.isConnected) {
+          console.log(chalk.green(`\n  Wallet loaded: ${info.address} (${defaultWallet})`));
+          return info;
         }
-      };
+      } catch {
+        console.log(chalk.dim(`\n  Default wallet "${defaultWallet}" not found.`));
+      }
+    }
 
-      stdin.on('data', onData);
-    });
+    // No wallet available — show wallet menu
+    return this.showWalletMenu(store);
   }
 
   /**
-   * Interactive wallet setup menu shown in live mode when no wallet is connected.
-   * Returns the user's chosen path: 'connected' | 'simulation' | 'exit'.
+   * Wallet setup menu for live mode.
+   * No simulation fallback — user must resolve wallet or exit.
    */
-  private async showLiveWalletMenu(store: WalletStore): Promise<'connected' | 'simulation' | 'exit'> {
+  private async showWalletMenu(store: WalletStore): Promise<{ address: string } | null> {
     const printOptions = (): void => {
       console.log('');
-      console.log(chalk.bold('  Choose an option:'));
+      console.log(chalk.yellow('  No wallet connected.'));
       console.log('');
-      console.log(`    ${chalk.cyan('1')}  wallet import`);
-      console.log(`    ${chalk.cyan('2')}  wallet connect <path>`);
-      console.log(`    ${chalk.cyan('3')}  continue in simulation`);
-      console.log(`    ${chalk.cyan('4')}  exit`);
+      console.log(`    ${chalk.cyan('1)')} Import wallet`);
+      console.log(`    ${chalk.cyan('2)')} Connect wallet file`);
+      console.log(`    ${chalk.cyan('3)')} List saved wallets`);
+      console.log(`    ${chalk.cyan('4)')} Exit`);
       console.log('');
     };
 
-    console.log('');
-    console.log(chalk.bold.red('  LIVE TRADING MODE'));
-    console.log('');
-    console.log(chalk.yellow('  No wallet connected.'));
     printOptions();
 
     while (true) {
@@ -395,30 +351,330 @@ export class FlashTerminal {
       switch (choice) {
         case '1': {
           const result = await this.handleWalletImportFlow(store);
-          if (result) return 'connected';
+          if (result) return { address: this.walletManager.address! };
           printOptions();
           continue;
         }
 
         case '2': {
           const result = await this.handleWalletConnectFlow();
-          if (result) return 'connected';
+          if (result) return { address: this.walletManager.address! };
           printOptions();
           continue;
         }
 
-        case '3':
-          console.log(chalk.yellow('\n  Switching to simulation mode.\n'));
-          return 'simulation';
+        case '3': {
+          // List saved wallets and let user pick one
+          const wallets = store.listWallets();
+          if (wallets.length === 0) {
+            console.log(chalk.dim('\n  No saved wallets found.\n'));
+          } else {
+            console.log('');
+            console.log(chalk.bold('  Saved Wallets:'));
+            for (const name of wallets) {
+              try {
+                const addr = store.getAddress(name);
+                console.log(`    ${chalk.cyan(name)} → ${chalk.dim(shortAddress(addr))}`);
+              } catch {
+                console.log(`    ${chalk.cyan(name)} → ${chalk.red('(error reading)')}`);
+              }
+            }
+            console.log('');
+
+            const walletName = (await this.ask(`  ${chalk.yellow('Use wallet (name or Enter to cancel):')} `)).trim();
+            if (walletName) {
+              try {
+                const walletPath = store.getWalletPath(walletName);
+                const info = this.tryConnectWallet(walletPath);
+                if (info) {
+                  store.setDefault(walletName);
+                  return info;
+                }
+              } catch (error: unknown) {
+                console.log(chalk.red(`  ${getErrorMessage(error)}`));
+              }
+            }
+          }
+          printOptions();
+          continue;
+        }
 
         case '4':
-          return 'exit';
+          return null;
 
         default:
           console.log(chalk.dim('  Enter 1, 2, 3, or 4.'));
           continue;
       }
     }
+  }
+
+  // ─── Mode Banners ──────────────────────────────────────────────────
+
+  private showSimulationBanner(): void {
+    console.log('');
+    console.log(chalk.yellow.bold('  ⚡ FLASH AI TERMINAL ⚡'));
+    console.log(chalk.yellow('  ━━━━━━━━━━━━━━━━━━━━━━━━'));
+    console.log('');
+    console.log(chalk.bgYellow.black(' SIMULATION MODE '));
+    console.log('');
+    console.log(`  Balance: ${chalk.green('$' + this.flashClient.getBalance().toFixed(2))}`);
+    console.log(chalk.dim('  Trades are simulated. No real transactions.'));
+    console.log('');
+    console.log(chalk.dim('  Type "help" for commands.'));
+    console.log(chalk.dim('  Type "exit" to close the terminal.'));
+    console.log('');
+  }
+
+  private async showLiveBanner(address: string): Promise<void> {
+    console.log('');
+    console.log(chalk.red.bold('  ⚡ FLASH AI TERMINAL ⚡'));
+    console.log(chalk.red('  ━━━━━━━━━━━━━━━━━━━━━━━━'));
+    console.log('');
+    console.log(chalk.bgRed.white.bold(' LIVE TRADING MODE '));
+    console.log('');
+    console.log(`  Wallet:  ${chalk.cyan(address)}`);
+    console.log(`  Network: ${chalk.bold(this.config.network)}`);
+
+    try {
+      const bal = await this.walletManager.getBalance();
+      console.log(`  Balance: ${chalk.green(bal.toFixed(4))} SOL`);
+    } catch {
+      // silently ignore balance fetch errors at startup
+    }
+
+    console.log('');
+    console.log(chalk.yellow('  WARNING'));
+    console.log(chalk.dim('  Transactions executed here are real.'));
+    console.log('');
+    console.log(chalk.dim('  Type "help" for commands.'));
+    console.log(chalk.dim('  Type "exit" to close the terminal.'));
+    console.log('');
+  }
+
+  // ─── Intelligence Screen ─────────────────────────────────────────
+
+  private async showIntelligenceScreen(walletAddress: string | null): Promise<void> {
+    const isSim = this.config.simulationMode;
+    const modeColor = isSim ? chalk.yellow : chalk.red;
+    const modeLabel = isSim ? 'SIMULATION' : 'LIVE TRADING';
+    const modeBg = isSim ? chalk.bgYellow.black : chalk.bgRed.white.bold;
+
+    // Header
+    console.log('');
+    console.log(modeColor.bold('  ⚡ FLASH AI TERMINAL ⚡'));
+    console.log(modeColor('  ━━━━━━━━━━━━━━━━━━━━━━━━'));
+    console.log('');
+    console.log(`  ${modeBg(` ${modeLabel} `)}`);
+    console.log('');
+
+    // Wallet / Balance
+    if (isSim) {
+      console.log(`  Balance: ${chalk.green('$' + this.flashClient.getBalance().toFixed(2))}`);
+      console.log(chalk.dim('  Trades are simulated. No real transactions.'));
+    } else if (walletAddress) {
+      console.log(`  Wallet:  ${chalk.cyan(walletAddress)}`);
+      console.log(`  Network: ${chalk.bold(this.config.network)}`);
+      try {
+        const bal = await this.walletManager.getBalance();
+        console.log(`  Balance: ${chalk.green(bal.toFixed(4))} SOL`);
+      } catch {
+        // best-effort
+      }
+      console.log('');
+      console.log(chalk.yellow('  WARNING'));
+      console.log(chalk.dim('  Transactions executed here are real.'));
+    }
+    console.log('');
+
+    // Fetch intelligence data with a timeout — don't block startup
+    try {
+      const intel = await this.fetchIntelligence();
+      if (intel) {
+        this.renderIntelligence(intel);
+      }
+    } catch {
+      // Intelligence screen is best-effort — startup continues regardless
+    }
+
+    console.log(chalk.dim('  Type "help" for commands, "scan" for opportunities.'));
+    console.log(chalk.dim('  Type "exit" to close the terminal.'));
+    console.log('');
+  }
+
+  private async fetchIntelligence(): Promise<IntelligenceData | null> {
+    const INTEL_TIMEOUT = 5_000; // 5s max for intelligence fetch
+
+    return new Promise<IntelligenceData | null>((resolve) => {
+      const timer = setTimeout(() => resolve(null), INTEL_TIMEOUT);
+
+      this.doFetchIntelligence()
+        .then((data) => { clearTimeout(timer); resolve(data); })
+        .catch(() => { clearTimeout(timer); resolve(null); });
+    });
+  }
+
+  private async doFetchIntelligence(): Promise<IntelligenceData> {
+    const inspector = getInspector(this.context);
+    const snapshot = await inspector.getFullSnapshot();
+
+    const data: IntelligenceData = {
+      marketCount: snapshot.markets.length,
+      positionCount: snapshot.positions.length,
+      portfolioBalance: snapshot.portfolio.balance,
+      totalPnl: snapshot.portfolio.totalUnrealizedPnl,
+    };
+
+    // Regime detection
+    if (snapshot.markets.length > 0) {
+      try {
+        const rd = getRegimeDetector();
+        const regimes = rd.detectAll(snapshot.markets, snapshot.volume, snapshot.openInterest);
+        if (regimes.size > 0) {
+          const counts = new Map<string, number>();
+          for (const [, state] of regimes) {
+            counts.set(state.regime, (counts.get(state.regime) ?? 0) + 1);
+          }
+          data.dominantRegime = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+        }
+      } catch {
+        // regime detection is best-effort
+      }
+    }
+
+    // Top opportunities via scanner
+    try {
+      const scanner = getScanner(this.context);
+      const balance = this.flashClient.getBalance();
+      const opps = await scanner.scan(balance, 3);
+      if (opps.length > 0) {
+        data.opportunities = opps.map((o) => ({
+          market: o.market,
+          direction: o.direction,
+          confidence: o.confidence,
+          regime: o.regime,
+        }));
+      }
+    } catch {
+      // scanner is best-effort
+    }
+
+    return data;
+  }
+
+  private renderIntelligence(intel: IntelligenceData): void {
+    console.log(chalk.bold('  Market Intelligence'));
+    console.log(chalk.dim('  ─────────────────────────────────────────'));
+    console.log('');
+
+    // Regime
+    if (intel.dominantRegime) {
+      console.log(`  Regime:    ${this.colorRegime(intel.dominantRegime)}`);
+    } else {
+      console.log(chalk.dim('  Regime:    Data unavailable'));
+    }
+
+    // Coverage
+    console.log(`  Markets:   ${chalk.bold(String(intel.marketCount))} scanned`);
+    console.log('');
+
+    // Top Opportunities
+    if (intel.opportunities && intel.opportunities.length > 0) {
+      console.log(chalk.bold('  Top Opportunities'));
+      for (let i = 0; i < intel.opportunities.length; i++) {
+        const o = intel.opportunities[i];
+        const dir = o.direction === 'long'
+          ? chalk.green('LONG ')
+          : chalk.red('SHORT');
+        const conf = `${(o.confidence * 100).toFixed(0)}%`;
+        console.log(`    ${i + 1}. ${o.market.padEnd(6)} ${dir}  ${conf}`);
+      }
+    } else {
+      console.log(chalk.bold('  Top Opportunities'));
+      console.log(chalk.dim('    No clear signals detected.'));
+    }
+    console.log('');
+
+    // Portfolio summary (only if positions exist)
+    if (intel.positionCount > 0) {
+      console.log(chalk.bold('  Portfolio'));
+      console.log(`    Positions: ${intel.positionCount}  PnL: ${intel.totalPnl >= 0 ? chalk.green(formatUsd(intel.totalPnl)) : chalk.red(formatUsd(intel.totalPnl))}`);
+      console.log('');
+    }
+  }
+
+  private colorRegime(regime: string): string {
+    switch (regime) {
+      case MarketRegime.TRENDING: return chalk.green(regime);
+      case MarketRegime.RANGING: return chalk.blue(regime);
+      case MarketRegime.HIGH_VOLATILITY: return chalk.red(regime);
+      case MarketRegime.LOW_VOLATILITY: return chalk.gray(regime);
+      case MarketRegime.WHALE_DOMINATED: return chalk.magenta(regime);
+      case MarketRegime.LOW_LIQUIDITY: return chalk.yellow(regime);
+      default: return chalk.gray(regime);
+    }
+  }
+
+  // ─── Wallet Flows ──────────────────────────────────────────────────
+
+  /** Try to connect a wallet from a file path. Returns info on success, null on failure. */
+  private tryConnectWallet(path: string): { address: string } | null {
+    try {
+      const result = this.walletManager.loadFromFile(path);
+      return { address: result.address };
+    } catch (error: unknown) {
+      console.log(chalk.red(`  Failed to load wallet: ${getErrorMessage(error)}`));
+      return null;
+    }
+  }
+
+  /** Blocking question prompt. */
+  private ask(question: string): Promise<string> {
+    return new Promise((resolve) => {
+      this.rl.question(question, resolve);
+    });
+  }
+
+  /**
+   * Read a line of input with echo disabled.
+   * Uses a temporary readline with no output to guarantee zero echo,
+   * plus ANSI hide sequences as a belt-and-suspenders safeguard.
+   */
+  private readHidden(prompt: string): Promise<string> {
+    return new Promise((resolve) => {
+      this.rl.pause();
+
+      process.stdout.write(prompt);
+
+      // ANSI escape: hide text (makes any echoed chars invisible)
+      process.stdout.write('\x1B[8m');
+
+      // Create a temporary readline with no output stream — guarantees no echo
+      const hiddenRl = createInterface({
+        input: process.stdin,
+        output: undefined,
+        terminal: false,
+      });
+
+      hiddenRl.once('line', (line) => {
+        hiddenRl.close();
+
+        // ANSI escape: reveal text (restore normal display)
+        process.stdout.write('\x1B[28m');
+        process.stdout.write('\n');
+
+        this.rl.resume();
+        resolve(line.trim());
+      });
+
+      // Handle Ctrl+C / stream close
+      hiddenRl.once('close', () => {
+        process.stdout.write('\x1B[28m');
+        process.stdout.write('\n');
+        this.rl.resume();
+        resolve('');
+      });
+    });
   }
 
   /**
@@ -434,7 +690,6 @@ export class FlashTerminal {
       return false;
     }
 
-    // Sanitize check: alphanumeric/hyphen/underscore, 1-64 chars
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
       console.log(chalk.red('  Name must be 1-64 alphanumeric/hyphen/underscore characters.'));
       return false;
@@ -478,7 +733,6 @@ export class FlashTerminal {
       console.log(chalk.red(`  Import failed: ${getErrorMessage(error)}`));
       return false;
     } finally {
-      // Zero out sensitive data from memory
       if (secretKey) {
         secretKey.fill(0);
       }
@@ -492,7 +746,9 @@ export class FlashTerminal {
   private async handleWalletConnectFlow(): Promise<boolean> {
     console.log('');
 
-    const rawPath = (await this.ask(`  ${chalk.yellow('Enter keypair path:')} `)).trim();
+    console.log(chalk.dim('  Enter path to your Solana wallet JSON file'));
+    console.log(chalk.dim('  Example: ~/.config/solana/id.json'));
+    const rawPath = (await this.ask(`  ${chalk.yellow('Path:')} `)).trim();
     if (!rawPath) {
       console.log(chalk.red('  No path provided.'));
       return false;
@@ -511,6 +767,8 @@ export class FlashTerminal {
     const info = this.tryConnectWallet(expandedPath);
     if (!info) return false;
 
+    console.log(chalk.green(`  Connected: ${info.address}`));
+
     // Show balance
     try {
       const bal = await this.walletManager.getBalance();
@@ -523,8 +781,13 @@ export class FlashTerminal {
     return true;
   }
 
-  /** Handle wallet disconnect: stop autopilot, switch to sim, swap client, update prompt. */
-  private handleDisconnect(): void {
+  // ─── Wallet Disconnect (Mode-Locked) ──────────────────────────────
+
+  /**
+   * Handle wallet disconnect in live mode.
+   * Mode stays locked — only disables trading capability.
+   */
+  private handleWalletDisconnected(): void {
     // Stop autopilot if running
     try {
       const autopilot = getAutopilot(this.context);
@@ -536,28 +799,17 @@ export class FlashTerminal {
       // No autopilot instance — fine
     }
 
-    // Switch to simulation mode
-    if (!this.config.simulationMode) {
-      this.config.simulationMode = true;
-      this.context.simulationMode = true;
-    }
-
-    // Swap to simulation client
-    this.flashClient = new SimulatedFlashClient(10_000);
-    this.context.flashClient = this.flashClient;
-
-    // Rebuild tool engine with updated context
-    this.engine = new ToolEngine(this.context);
-
-    this.updatePrompt();
+    // Do NOT change mode — mode is locked for the session
+    // Trading commands will fail naturally since wallet is disconnected
   }
 
-  /** Handle wallet connected: switch to live mode, reinitialize client, update prompt. */
-  private async handleWalletConnected(): Promise<void> {
-    // Already live — just rebuild the client with the new wallet
-    // Or switching from sim to live
-    this.config.simulationMode = false;
-    this.context.simulationMode = false;
+  /**
+   * Handle wallet reconnected in live mode.
+   * Reinitialize the live client with the new wallet.
+   */
+  private async handleWalletReconnected(): Promise<void> {
+    // Only relevant in live mode — rebuild client with new wallet
+    if (this.config.simulationMode) return;
 
     const connection = createConnection(this.config.rpcUrl);
 
@@ -565,23 +817,19 @@ export class FlashTerminal {
       const { FlashClient } = await import('../client/flash-client.js');
       this.flashClient = new FlashClient(connection, this.walletManager, this.config);
       this.context.flashClient = this.flashClient;
+      this.context.walletAddress = this.walletManager.address ?? 'unknown';
     } catch (error: unknown) {
-      // If live client fails to init, stay in simulation
-      console.log(chalk.red(`  Failed to initialize live client: ${getErrorMessage(error)}`));
-      console.log(chalk.yellow('  Remaining in simulation mode.'));
-      this.config.simulationMode = true;
-      this.context.simulationMode = true;
-      this.flashClient = new SimulatedFlashClient(10_000);
-      this.context.flashClient = this.flashClient;
+      console.log(chalk.red(`  Failed to reinitialize live client: ${getErrorMessage(error)}`));
+      console.log(chalk.dim('  Trading commands may fail until a wallet is reconnected.'));
     }
 
     // Rebuild tool engine with updated context
     this.engine = new ToolEngine(this.context);
-
-    this.updatePrompt();
   }
 
-  /** Phase 2: Update prompt prefix based on current mode */
+  // ─── Prompt ────────────────────────────────────────────────────────
+
+  /** Update prompt prefix based on current mode */
   private updatePrompt(): void {
     const prefix = this.config.simulationMode
       ? chalk.yellow('flash [sim]')
@@ -589,46 +837,23 @@ export class FlashTerminal {
     this.rl.setPrompt(`${prefix} > `);
   }
 
-  /** Phase 10: Validate configuration at startup */
-  private validateStartup(): void {
-    const warnings: string[] = [];
+  // ─── History ───────────────────────────────────────────────────────
 
-    if (!this.config.rpcUrl || this.config.rpcUrl === 'https://api.mainnet-beta.solana.com') {
-      warnings.push('Using default public RPC — set RPC_URL for better performance');
-    }
-
-    if (!this.config.anthropicApiKey || this.config.anthropicApiKey === 'sk-ant-...') {
-      warnings.push('No ANTHROPIC_API_KEY — AI features disabled, using local parsing only');
-    }
-
-    if (!this.config.simulationMode) {
-      warnings.push('LIVE MODE active — real transactions will be submitted');
-    }
-
-    if (warnings.length > 0) {
-      console.log('');
-      for (const w of warnings) {
-        console.log(chalk.dim(`  [startup] ${w}`));
-      }
-    }
-  }
-
-  /** Phase 5: Load command history from file */
+  /** Load command history from file */
   private loadHistory(): void {
     try {
       const data = readFileSync(HISTORY_FILE, 'utf-8');
       const lines = data.split('\n').filter(Boolean).slice(-MAX_HISTORY);
-      // readline stores history newest-first internally
       const rlAny = this.rl as unknown as { history: string[] };
       if (Array.isArray(rlAny.history)) {
         rlAny.history = lines.reverse();
       }
     } catch {
-      // No history file yet — that's fine
+      // No history file yet
     }
   }
 
-  /** Phase 5: Save command history to file */
+  /** Save command history to file */
   private saveHistory(): void {
     try {
       const rlAny = this.rl as unknown as { history: string[] };
@@ -637,12 +862,17 @@ export class FlashTerminal {
         writeFileSync(HISTORY_FILE, lines.join('\n') + '\n', { mode: 0o600 });
       }
     } catch {
-      // Best-effort — don't fail on history save
+      // Best-effort
     }
   }
 
-  /** Phase 9: Clean shutdown */
+  // ─── Shutdown ──────────────────────────────────────────────────────
+
+  private isShuttingDown = false;
+
   private shutdown(): void {
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
     this.saveHistory();
     try {
       const autopilot = getAutopilot(this.context);
@@ -655,11 +885,12 @@ export class FlashTerminal {
     process.exit(0);
   }
 
+  // ─── Command Handler ──────────────────────────────────────────────
+
   private async handleInput(input: string): Promise<void> {
-    // Phase 12: Start timing
     const startTime = Date.now();
 
-    // Phase 11: Fast dispatch for single-token commands
+    // Fast dispatch for single-token commands
     let intent: ParsedIntent;
     const lower = input.toLowerCase();
     const fastIntent = FAST_DISPATCH[lower];
@@ -701,14 +932,14 @@ export class FlashTerminal {
     // Display result
     console.log(result.message);
 
-    // Handle wallet disconnect: stop autopilot, switch to simulation, update prompt
+    // Handle wallet disconnect — mode stays locked
     if (result.data?.disconnected) {
-      this.handleDisconnect();
+      this.handleWalletDisconnected();
     }
 
-    // Handle wallet connected: switch to live mode, reinitialize client, update prompt
-    if (result.data?.walletConnected) {
-      await this.handleWalletConnected();
+    // Handle wallet reconnected in live mode — rebuild client
+    if (result.data?.walletConnected && !this.config.simulationMode) {
+      await this.handleWalletReconnected();
     }
 
     // Handle confirmation flow
@@ -733,14 +964,14 @@ export class FlashTerminal {
       }
     }
 
-    // Phase 12: Slow command warning
+    // Slow command warning
     const elapsed = Date.now() - startTime;
     if (elapsed > SLOW_COMMAND_MS) {
       console.log(chalk.dim(`  [${(elapsed / 1000).toFixed(1)}s]`));
     }
   }
 
-  /** Phase 8: Confirmation via pendingConfirmation callback */
+  /** Confirmation via pendingConfirmation callback */
   private confirm(prompt: string): Promise<boolean> {
     return new Promise((resolve) => {
       process.stdout.write(`  ${chalk.yellow(prompt)} ${chalk.dim('(yes/no)')} `);

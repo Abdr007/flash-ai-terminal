@@ -47,7 +47,7 @@ export function getClawdApiKey(): string | undefined {
   return _clawdApiKey;
 }
 
-function getInspector(context: ToolContext): SolanaInspector {
+export function getInspector(context: ToolContext): SolanaInspector {
   if (!inspectorInstance) {
     inspectorInstance = new SolanaInspector(context.flashClient, context.dataClient);
   }
@@ -157,10 +157,17 @@ export const clawdAnalyze: ToolDefinition = {
     const oi = openInterest.markets.find((m) => m.market.toUpperCase() === marketUpper);
     const totalOi = oi ? oi.longOi + oi.shortOi : 0;
 
-    // Volume for last day
+    // Volume for last day and growth trend
     const lastDay = volume.dailyVolumes.length > 0
       ? volume.dailyVolumes[volume.dailyVolumes.length - 1]
       : null;
+
+    let volumeGrowth = 0;
+    if (volume.dailyVolumes.length >= 6) {
+      const recent3 = volume.dailyVolumes.slice(-3).reduce((s, d) => s + d.volumeUsd, 0) / 3;
+      const prev3 = volume.dailyVolumes.slice(-6, -3).reduce((s, d) => s + d.volumeUsd, 0) / 3;
+      volumeGrowth = prev3 > 0 ? (recent3 - prev3) / prev3 : 0;
+    }
 
     const analysis: MarketAnalysis = {
       market: marketUpper,
@@ -173,35 +180,67 @@ export const clawdAnalyze: ToolDefinition = {
       summary: `${marketUpper} overall sentiment: ${overallSentiment}`,
     };
 
-    // Format output
-    const lines = [
-      '',
-      chalk.bold.cyan(`  ═══ ${marketUpper} Market Analysis ═══`),
-      '',
-      `  Price:         ${formatPrice(market.price)}  ${colorPercent(market.priceChange24h)}`,
-      `  Open Interest: ${formatUsd(totalOi)} (Long: ${formatUsd(oi?.longOi ?? 0)} / Short: ${formatUsd(oi?.shortOi ?? 0)})`,
-      `  24h Volume:    ${formatUsd(lastDay?.volumeUsd ?? 0)}`,
-      `  Max Leverage:  ${market.maxLeverage}x`,
-    ];
-
     // Regime detection
     const rd = getRegimeDetector();
     const regimeState = rd.detectRegime(market, volume, openInterest);
-    const rWeights = rd.getWeights(regimeState.regime);
-    lines.push(`  Regime:        ${regimeLabel(regimeState.regime)} ${chalk.dim(`(confidence ${(regimeState.confidence * 100).toFixed(0)}%)`)}`);
+
+    // Format output — structured sections with clear explanations
+    const lines = [
+      '',
+      chalk.bold(`  ${marketUpper} Market Analysis`),
+      chalk.dim('  ─────────────────────────────────────────'),
+      '',
+    ];
+
+    // Market Regime
+    lines.push(chalk.bold('  Market Regime'));
+    lines.push(`  ${regimeLabel(regimeState.regime)}`);
     lines.push('');
-    lines.push(chalk.bold('  Strategy Signals:'));
-    lines.push(chalk.dim(`  (Regime weights: momentum=${rWeights.momentum} mean-rev=${rWeights.meanReversion} whale=${rWeights.whaleFollow})`));
+
+    // Price
+    lines.push(chalk.bold('  Price'));
+    lines.push(`  ${formatPrice(market.price)}  ${colorPercent(market.priceChange24h)}`);
+    lines.push('');
+
+    // Volume
+    lines.push(chalk.bold('  Volume'));
+    if (lastDay) {
+      const volumeGrowthStr = volumeGrowth > 0.1
+        ? 'Trading volume increasing.'
+        : volumeGrowth < -0.1
+          ? 'Trading volume declining.'
+          : 'Trading volume stable.';
+      lines.push(`  24h: ${formatUsd(lastDay.volumeUsd)}  ${chalk.dim(volumeGrowthStr)}`);
+    } else {
+      lines.push(chalk.dim('  Data unavailable.'));
+    }
+    lines.push('');
+
+    // Open Interest
+    lines.push(chalk.bold('  Open Interest'));
+    if (oi && totalOi > 0) {
+      const longPct = ((oi.longOi / totalOi) * 100).toFixed(0);
+      const shortPct = ((oi.shortOi / totalOi) * 100).toFixed(0);
+      lines.push(`  ${formatUsd(totalOi)} total (${longPct}% long / ${shortPct}% short)`);
+    } else {
+      lines.push(chalk.dim('  Data unavailable.'));
+    }
+    lines.push('');
+
+    // Strategy Signals — each signal explains WHY it exists
+    lines.push(chalk.bold('  Strategy Signals'));
     lines.push('');
 
     for (const sig of signals) {
-      lines.push(`    ${chalk.bold(sig.name.padEnd(16))} ${signalColor(sig.signal).padEnd(20)} ${chalk.dim(`(${(sig.confidence * 100).toFixed(0)}% confidence)`)}`);
-      lines.push(`    ${chalk.dim(sig.reasoning)}`);
+      lines.push(`  ${chalk.bold(sig.name)} → ${signalColor(sig.signal)}`);
+      lines.push(`  ${chalk.dim(sig.reasoning)}`);
       lines.push('');
     }
 
+    // Overall confidence
+    const avgConfidence = signals.reduce((s, sig) => s + sig.confidence, 0) / signals.length;
     const sentimentColor = overallSentiment === 'BULLISH' ? chalk.green : overallSentiment === 'BEARISH' ? chalk.red : chalk.gray;
-    lines.push(`  Overall: ${sentimentColor(overallSentiment)}`);
+    lines.push(`  Overall: ${sentimentColor(overallSentiment)}  Confidence: ${(avgConfidence * 100).toFixed(0)}%`);
     lines.push('');
 
     return {
@@ -299,18 +338,24 @@ export const clawdSuggestTrade: ToolDefinition = {
     if (!suggestion) {
       return {
         success: false,
-        message: chalk.yellow('  No strong trade signal detected. Market conditions are unclear.'),
+        message: [
+          '',
+          chalk.bold('  Trade Suggestion'),
+          chalk.dim('  ─────────────────────────────────────────'),
+          '',
+          chalk.dim('  No strong trade signal detected.'),
+          chalk.dim('  Market conditions are unclear or data is insufficient.'),
+          '',
+        ].join('\n'),
       };
     }
 
     const sideColor = suggestion.side === 'long' ? chalk.green : chalk.red;
-    const sourceTag = source === 'claude'
-      ? chalk.magenta('AI Trade Suggestion')
-      : chalk.yellow('Suggested Trade (Strategy Engine)');
 
     const lines = [
       '',
-      chalk.bold(`  ═══ ${sourceTag} ═══`),
+      chalk.bold('  Trade Suggestion'),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
       `  Market:      ${chalk.bold(suggestion.market)}`,
       `  Direction:   ${sideColor(suggestion.side.toUpperCase())}`,
@@ -318,11 +363,11 @@ export const clawdSuggestTrade: ToolDefinition = {
       `  Collateral:  ${chalk.bold(formatUsd(suggestion.collateral))}`,
       `  Confidence:  ${chalk.bold((suggestion.confidence * 100).toFixed(0) + '%')}`,
       '',
-      chalk.bold('  Reasoning:'),
-      `  ${chalk.dim(suggestion.reasoning)}`,
+      chalk.bold('  Reasoning'),
+      `  ${suggestion.reasoning}`,
       '',
-      chalk.bold('  Risks:'),
-      ...suggestion.risks.map((r) => `    ${chalk.yellow('•')} ${r}`),
+      chalk.bold('  Risks'),
+      ...suggestion.risks.map((r) => `  ${chalk.yellow('•')} ${r}`),
       '',
       chalk.dim(`  To execute: ${suggestion.side} ${suggestion.market} $${suggestion.collateral} ${suggestion.leverage}x`),
       '',
@@ -360,37 +405,53 @@ export const clawdRiskReport: ToolDefinition = {
     const riskAssessments = assessAllPositions(positions);
     const exposure = computeExposure(portfolio);
 
+    const totalExposure = exposure.totalLongExposure + exposure.totalShortExposure;
+    const longPct = totalExposure > 0 ? ((exposure.totalLongExposure / totalExposure) * 100).toFixed(0) : '0';
+    const shortPct = totalExposure > 0 ? ((exposure.totalShortExposure / totalExposure) * 100).toFixed(0) : '0';
+
     const lines = [
       '',
-      chalk.bold.yellow('  ═══ Risk Report ═══'),
+      chalk.bold('  Risk Report'),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
-      chalk.bold('  Position Risks:'),
     ];
 
+    // Position risks
+    lines.push(chalk.bold('  Position Risks'));
+    lines.push('');
     for (const risk of riskAssessments) {
       const riskColor = risk.riskLevel === 'critical' ? chalk.red.bold
         : risk.riskLevel === 'warning' ? chalk.yellow
         : chalk.green;
-      lines.push(`    ${riskColor(`[${risk.riskLevel.toUpperCase()}]`)} ${risk.message}`);
+      lines.push(`  ${riskColor(`[${risk.riskLevel.toUpperCase()}]`)} ${risk.message}`);
     }
-
     lines.push('');
-    lines.push(chalk.bold('  Exposure Summary:'));
-    lines.push(`    Long Exposure:  ${formatUsd(exposure.totalLongExposure)}`);
-    lines.push(`    Short Exposure: ${formatUsd(exposure.totalShortExposure)}`);
-    lines.push(`    Net Exposure:   ${colorPnl(exposure.netExposure)}`);
-    lines.push(`    Collateral:     ${formatUsd(exposure.totalCollateral)}`);
-    lines.push(`    Utilization:    ${exposure.collateralUtilization.toFixed(1)}%`);
 
-    if (exposure.concentrationRisk.length > 0) {
-      lines.push('');
-      lines.push(chalk.bold('  Concentration:'));
-      for (const c of exposure.concentrationRisk) {
-        const warn = c.percentage > 50 ? chalk.yellow(' (concentrated)') : '';
-        lines.push(`    ${c.market}: ${c.percentage.toFixed(1)}%${warn}`);
-      }
+    // Exposure Summary
+    lines.push(chalk.bold('  Exposure Summary'));
+    lines.push('');
+    lines.push(`  Total Exposure:   ${formatUsd(totalExposure)}`);
+    lines.push('');
+    lines.push(chalk.bold('  Directional Bias'));
+    lines.push(`  LONG:  ${longPct}%`);
+    lines.push(`  SHORT: ${shortPct}%`);
+    lines.push('');
+
+    // Risk Analysis
+    const alerts: string[] = [];
+    if (exposure.concentrationRisk.some(c => c.percentage > 50)) {
+      alerts.push('Correlated markets detected');
+    }
+    if (exposure.collateralUtilization < 80) {
+      alerts.push('Exposure within configured limits');
+    } else {
+      alerts.push(`Collateral utilization at ${exposure.collateralUtilization.toFixed(0)}%`);
     }
 
+    lines.push(chalk.bold('  Risk Analysis'));
+    for (const alert of alerts) {
+      lines.push(`  ${chalk.yellow('•')} ${alert}`);
+    }
     lines.push('');
 
     return {
@@ -413,127 +474,118 @@ export const clawdDashboard: ToolDefinition = {
 
     const lines = [
       '',
-      chalk.bold.cyan('  ═══ Clawd Dashboard ═══'),
+      chalk.bold('  Dashboard'),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
     ];
 
-    // Autopilot status
-    const autopilot = getAutopilot(context);
-    const apState = autopilot.state;
-    const apStatus = apState.active ? chalk.green.bold('ACTIVE') : chalk.gray('INACTIVE');
-    lines.push(`  Autopilot: ${apStatus}`);
+    // ─── Market Overview ──────────────────────────────────────────────
+    lines.push(chalk.bold('  Market Overview'));
     lines.push('');
 
-    // Active strategy signals (from autopilot or computed fresh)
-    if (apState.lastSignals.length > 0) {
-      lines.push(chalk.bold('  Signals:'));
-      for (const sig of apState.lastSignals) {
-        const color = sig.signal === 'bullish' ? chalk.green : sig.signal === 'bearish' ? chalk.red : chalk.gray;
-        lines.push(`    ${sig.name}: ${color(sig.signal)}`);
-      }
-      lines.push('');
-    }
-
-    // Portfolio section
-    lines.push(chalk.bold('  Portfolio:'));
-    lines.push(`    Balance:       ${formatUsd(snapshot.portfolio.balance)}`);
-    lines.push(`    Collateral:    ${formatUsd(snapshot.portfolio.totalCollateralUsd)}`);
-    lines.push(`    Unrealized PnL: ${colorPnl(snapshot.portfolio.totalUnrealizedPnl)}`);
-    lines.push(`    Positions:     ${snapshot.positions.length}`);
-    lines.push('');
-
-    // Risk exposure
-    if (snapshot.positions.length > 0) {
-      const exposure = computeExposure(snapshot.portfolio);
-      const risks = assessAllPositions(snapshot.positions);
-      const minLiqDist = risks.length > 0
-        ? Math.min(...risks.map((r) => r.distanceToLiquidation))
-        : 0;
-
-      lines.push(chalk.bold('  Risk:'));
-      lines.push(`    Exposure:              ${formatUsd(exposure.totalLongExposure + exposure.totalShortExposure)}`);
-      lines.push(`    Liquidation Distance:  ${minLiqDist.toFixed(1)}%`);
-      lines.push('');
-    }
-
-    // Markets section
-    lines.push(chalk.bold('  Markets:'));
-    if (snapshot.markets.length > 0) {
-      const headers = ['Market', 'Price', '24h Change', 'OI Total'];
-      const rows = snapshot.markets.slice(0, 8).map((m) => [
-        m.symbol,
-        formatPrice(m.price),
-        colorPercent(m.priceChange24h),
-        formatUsd(m.openInterestLong + m.openInterestShort),
-      ]);
-      lines.push(formatTable(headers, rows).split('\n').map((l) => '    ' + l).join('\n'));
-    } else {
-      lines.push(chalk.dim('    No market data available'));
-    }
-    lines.push('');
-
-    // Market Regimes section
+    // Market Regime summary
+    let dominantRegime = 'Unknown';
     try {
       const rd = getRegimeDetector();
       const regimes = rd.detectAll(snapshot.markets, snapshot.volume, snapshot.openInterest);
       if (regimes.size > 0) {
-        lines.push(chalk.bold('  Market Regimes:'));
-        for (const [market, state] of regimes) {
-          lines.push(`    ${market.padEnd(8)} ${regimeLabel(state.regime)} ${chalk.dim(`(confidence ${(state.confidence * 100).toFixed(0)}%)`)}`);
+        // Find most common regime
+        const regimeCounts = new Map<string, number>();
+        for (const [, state] of regimes) {
+          regimeCounts.set(state.regime, (regimeCounts.get(state.regime) ?? 0) + 1);
         }
-        lines.push('');
+        dominantRegime = [...regimeCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'Unknown';
+        lines.push(`  Market Regime:    ${regimeLabel(dominantRegime)}`);
+      } else {
+        lines.push(chalk.dim('  Market Regime:    Data unavailable'));
       }
     } catch {
-      // Regime detection failure is non-critical for dashboard
+      lines.push(chalk.dim('  Market Regime:    Data unavailable'));
     }
+    lines.push('');
 
-    // Market Intelligence section
+    // Top Opportunities
     try {
       const scanner = getScanner(context);
       const balance = context.flashClient.getBalance();
       const opportunities = await scanner.scan(balance, 3);
       if (opportunities.length > 0) {
-        lines.push(chalk.bold('  Market Intelligence:'));
-        for (const opp of opportunities) {
+        lines.push(chalk.bold('  Top Opportunities'));
+        for (let i = 0; i < opportunities.length; i++) {
+          const opp = opportunities[i];
           const dirColor = opp.direction === 'long' ? chalk.green : chalk.red;
-          lines.push(`    ${opp.market.padEnd(6)} ${dirColor(opp.direction.toUpperCase().padEnd(6))} confidence: ${(opp.confidence * 100).toFixed(0)}%  score: ${opp.totalScore.toFixed(2)}  ${regimeLabel(opp.regime)}`);
+          lines.push(`  ${i + 1}  ${opp.market.padEnd(6)} ${dirColor(opp.direction.toUpperCase().padEnd(6))} ${(opp.confidence * 100).toFixed(0)}%`);
         }
-        lines.push('');
+      } else {
+        lines.push(chalk.bold('  Top Opportunities'));
+        lines.push(chalk.dim('  No clear opportunities detected.'));
       }
     } catch {
-      // Scanner failure is non-critical for dashboard
+      lines.push(chalk.bold('  Top Opportunities'));
+      lines.push(chalk.dim('  Data unavailable.'));
     }
+    lines.push('');
 
-    // Portfolio Intelligence section
+    // ─── Portfolio ────────────────────────────────────────────────────
+    lines.push(chalk.bold('  Portfolio'));
+    lines.push('');
+    lines.push(`  Positions:       ${snapshot.positions.length}`);
     if (snapshot.positions.length > 0) {
-      try {
-        const pm = getPortfolioManager();
-        const balance = context.flashClient.getBalance();
-        const pState = pm.getState(snapshot.positions, balance);
-        lines.push(chalk.bold('  Portfolio Intelligence:'));
-        lines.push(`    Capital:     ${formatUsd(pState.totalCapital)} (${pState.utilizationPct.toFixed(0)}% utilized)`);
-        lines.push(`    Free:        ${formatUsd(pState.freeCapital)}`);
-        lines.push(`    Long:        ${formatUsd(pState.exposureLong)}`);
-        lines.push(`    Short:       ${formatUsd(pState.exposureShort)}`);
-        const rebalance = pm.analyzeRebalance(snapshot.positions, balance);
-        if (!rebalance.balanced) {
-          lines.push(`    Balance:     ${chalk.yellow(rebalance.directionalBias + ' — rebalance suggested')}`);
-        } else {
-          lines.push(`    Balance:     ${chalk.green('Balanced')}`);
+      const exposure = computeExposure(snapshot.portfolio);
+      const totalExposure = exposure.totalLongExposure + exposure.totalShortExposure;
+      lines.push(`  Total Exposure:  ${formatUsd(totalExposure)}`);
+
+      const longPct = totalExposure > 0 ? ((exposure.totalLongExposure / totalExposure) * 100).toFixed(0) : '0';
+      const shortPct = totalExposure > 0 ? ((exposure.totalShortExposure / totalExposure) * 100).toFixed(0) : '0';
+      const bias = exposure.totalLongExposure > exposure.totalShortExposure ? 'LONG' : exposure.totalShortExposure > exposure.totalLongExposure ? 'SHORT' : 'NEUTRAL';
+      lines.push(`  Directional Bias: ${bias}`);
+      lines.push(`  Long: ${longPct}%  Short: ${shortPct}%`);
+      lines.push(`  Unrealized PnL:  ${colorPnl(snapshot.portfolio.totalUnrealizedPnl)}`);
+    } else {
+      lines.push(`  Balance:         ${formatUsd(snapshot.portfolio.balance)}`);
+    }
+    lines.push('');
+
+    // ─── Risk Alerts ─────────────────────────────────────────────────
+    if (snapshot.positions.length > 0) {
+      const risks = assessAllPositions(snapshot.positions);
+      const exposure = computeExposure(snapshot.portfolio);
+      const alerts: string[] = [];
+
+      // Check for risk conditions
+      const criticalRisks = risks.filter(r => r.riskLevel === 'critical');
+      const warningRisks = risks.filter(r => r.riskLevel === 'warning');
+      if (criticalRisks.length > 0) {
+        alerts.push(`${criticalRisks.length} position(s) at critical liquidation risk`);
+      }
+      if (warningRisks.length > 0) {
+        alerts.push(`${warningRisks.length} position(s) with elevated leverage`);
+      }
+
+      // Concentration risk
+      for (const c of exposure.concentrationRisk) {
+        if (c.percentage > 50) {
+          alerts.push(`${c.market} concentration: ${c.percentage.toFixed(0)}% of exposure`);
+        }
+      }
+
+      if (alerts.length > 0) {
+        lines.push(chalk.bold('  Risk Alerts'));
+        for (const alert of alerts) {
+          lines.push(`  ${chalk.yellow('•')} ${alert}`);
         }
         lines.push('');
-      } catch {
-        // Portfolio computation failure is non-critical for dashboard
       }
     }
 
-    // Platform stats
-    lines.push(chalk.bold('  Platform Stats (30d):'));
-    lines.push(`    Volume:        ${formatUsd(snapshot.overviewStats.volumeUsd)} (${formatPercent(snapshot.overviewStats.volumeChangePct)})`);
-    lines.push(`    Trades:        ${snapshot.overviewStats.trades.toLocaleString()}`);
-    lines.push(`    Fees:          ${formatUsd(snapshot.overviewStats.feesUsd)}`);
-    lines.push(`    Traders:       ${snapshot.overviewStats.uniqueTraders.toLocaleString()}`);
-    lines.push('');
+    // ─── Autopilot (simulation only) ─────────────────────────────────
+    if (context.simulationMode) {
+      const autopilot = getAutopilot(context);
+      const apState = autopilot.state;
+      const apStatus = apState.active ? chalk.green.bold('ACTIVE') : chalk.gray('INACTIVE');
+      lines.push(`  Autopilot: ${apStatus}`);
+      lines.push('');
+    }
 
     return {
       success: true,
@@ -585,7 +637,15 @@ export const clawdWhaleActivity: ToolDefinition = {
       const marketMsg = marketFilter ? ` in ${marketFilter}` : '';
       return {
         success: true,
-        message: chalk.dim(`\n  No whale activity detected${marketMsg} (threshold: $${WHALE_THRESHOLD.toLocaleString()}).\n`),
+        message: [
+          '',
+          chalk.bold('  Whale Activity'),
+          chalk.dim('  ─────────────────────────────────────────'),
+          '',
+          chalk.dim(`  No whale activity detected${marketMsg}.`),
+          chalk.dim(`  Threshold: positions >= $${WHALE_THRESHOLD.toLocaleString()}`),
+          '',
+        ].join('\n'),
       };
     }
 
@@ -604,11 +664,12 @@ export const clawdWhaleActivity: ToolDefinition = {
     const marketMsg = marketFilter ? ` — ${marketFilter}` : '';
     const lines = [
       '',
-      chalk.bold.blue(`  ═══ Whale Activity${marketMsg} ═══`),
+      chalk.bold(`  Whale Activity${marketMsg}`),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
       formatTable(headers, rows).split('\n').map((l) => '    ' + l).join('\n'),
       '',
-      chalk.dim(`  Showing ${top.length} positions >= $${WHALE_THRESHOLD.toLocaleString()}`),
+      chalk.dim(`  ${top.length} positions >= $${WHALE_THRESHOLD.toLocaleString()}`),
       '',
     ];
 
@@ -633,54 +694,62 @@ export const clawdScanMarkets: ToolDefinition = {
     if (opportunities.length === 0) {
       return {
         success: true,
-        message: chalk.dim('\n  No trade opportunities detected. Market conditions are unclear.\n'),
+        message: [
+          '',
+          chalk.bold('  Market Opportunities'),
+          chalk.dim('  ─────────────────────────────────────────'),
+          '',
+          chalk.dim('  No trade opportunities detected.'),
+          chalk.dim('  Market conditions are unclear or data is insufficient.'),
+          '',
+        ].join('\n'),
       };
     }
 
     const lines = [
       '',
-      chalk.bold.cyan('  ═══ Market Opportunity Scanner ═══'),
+      chalk.bold('  Market Opportunities'),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
     ];
 
-    // Table header
-    const headers = ['Rank', 'Market', 'Direction', 'Confidence', 'Score', 'Leverage', 'Regime'];
-    const rows = opportunities.map((opp, i) => [
-      String(i + 1),
-      opp.market,
-      opp.direction === 'long' ? chalk.green('LONG') : chalk.red('SHORT'),
-      `${(opp.confidence * 100).toFixed(0)}%`,
-      opp.totalScore.toFixed(2),
-      `${opp.recommendedLeverage}x`,
-      regimeLabel(opp.regime),
-    ]);
+    // Clean ranked table
+    const headers = ['Rank', 'Asset', 'Direction', 'Confidence', 'Strategy'];
+    const rows = opportunities.map((opp, i) => {
+      // Identify the dominant strategy driving this opportunity
+      const dominantSignal = opp.signals
+        .filter(s => s.signal !== 'neutral')
+        .sort((a, b) => b.confidence - a.confidence)[0];
+      const strategyName = dominantSignal?.name ?? 'Mixed';
+
+      return [
+        String(i + 1),
+        opp.market,
+        opp.direction === 'long' ? chalk.green('LONG') : chalk.red('SHORT'),
+        `${(opp.confidence * 100).toFixed(0)}%`,
+        strategyName,
+      ];
+    });
 
     lines.push(formatTable(headers, rows).split('\n').map((l) => '    ' + l).join('\n'));
     lines.push('');
 
     // Detailed breakdown for top 3
     const top3 = opportunities.slice(0, 3);
-    lines.push(chalk.bold('  Top Opportunities:'));
-    lines.push('');
 
     for (const opp of top3) {
       const dirColor = opp.direction === 'long' ? chalk.green : chalk.red;
-      lines.push(`    ${chalk.bold(opp.market)} ${dirColor(opp.direction.toUpperCase())}`);
+      lines.push(`  ${chalk.bold(opp.market)} ${dirColor(opp.direction.toUpperCase())}  ${chalk.dim(`Regime: ${opp.regime ?? 'unknown'}`)}`);
       lines.push('');
 
       for (const sig of opp.signals) {
-        const sigColor = sig.signal === 'bullish' ? chalk.green
-          : sig.signal === 'bearish' ? chalk.red
-          : chalk.gray;
-        lines.push(`      ${sig.name.padEnd(16)} ${sigColor(sig.signal.toUpperCase().padEnd(8))} ${chalk.dim(`${(sig.confidence * 100).toFixed(0)}%`)}`);
+        lines.push(`    ${chalk.bold(sig.name)} → ${signalColor(sig.signal)}`);
+        lines.push(`    ${chalk.dim(sig.reasoning)}`);
+        lines.push('');
       }
-
-      lines.push(`      ${'Score'.padEnd(16)} ${chalk.bold(opp.totalScore.toFixed(2).padEnd(8))} ${chalk.dim(`vol=${opp.volumeScore.toFixed(2)} oi=${opp.oiScore.toFixed(2)} whale=${opp.whaleScore.toFixed(2)}`)}`);
-      lines.push(`      ${'Suggested'.padEnd(16)} ${chalk.bold(`${opp.recommendedLeverage}x`)} ${chalk.dim(`$${opp.recommendedCollateral}`)}`);
-      lines.push('');
     }
 
-    lines.push(chalk.dim(`  Scanned ${opportunities.length} markets. Use "suggest trade <market>" to execute.`));
+    lines.push(chalk.dim(`  All data is real-time. Use "analyze <asset>" for deeper analysis.`));
     lines.push('');
 
     return {
@@ -719,8 +788,7 @@ export const autopilotStart: ToolDefinition = {
         message: [
           '',
           chalk.red('  Autopilot disabled in LIVE mode.'),
-          chalk.yellow('  Run terminal with: flash --sim'),
-          chalk.dim('  to test automated trading.'),
+          chalk.dim('  Restart terminal and select Simulation to use autopilot.'),
           '',
         ].join('\n'),
       };
@@ -762,8 +830,7 @@ export const autopilotStop: ToolDefinition = {
         message: [
           '',
           chalk.red('  Autopilot disabled in LIVE mode.'),
-          chalk.yellow('  Run terminal with: flash --sim'),
-          chalk.dim('  to test automated trading.'),
+          chalk.dim('  Restart terminal and select Simulation to use autopilot.'),
           '',
         ].join('\n'),
       };
@@ -785,8 +852,7 @@ export const autopilotStatus: ToolDefinition = {
         message: [
           '',
           chalk.red('  Autopilot disabled in LIVE mode.'),
-          chalk.yellow('  Run terminal with: flash --sim'),
-          chalk.dim('  to test automated trading.'),
+          chalk.dim('  Restart terminal and select Simulation to use autopilot.'),
           '',
         ].join('\n'),
       };
@@ -813,7 +879,8 @@ export const portfolioStateTool: ToolDefinition = {
 
     const lines = [
       '',
-      chalk.bold.cyan('  ═══ Portfolio State ═══'),
+      chalk.bold('  Portfolio State'),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
       `  Total Capital:     ${formatUsd(state.totalCapital)}`,
       `  Allocated:         ${formatUsd(state.allocatedCapital)}  (${state.utilizationPct.toFixed(1)}%)`,
@@ -879,7 +946,8 @@ export const portfolioExposureTool: ToolDefinition = {
 
     const lines = [
       '',
-      chalk.bold.cyan('  ═══ Portfolio Exposure ═══'),
+      chalk.bold('  Portfolio Exposure'),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
       `  Total Exposure:  ${formatUsd(totalExposure)}`,
       `  Long:            ${formatUsd(state.exposureLong)} (${longPct.toFixed(1)}%)`,
@@ -934,7 +1002,8 @@ export const portfolioRebalanceTool: ToolDefinition = {
 
     const lines = [
       '',
-      chalk.bold.cyan('  ═══ Portfolio Rebalance Analysis ═══'),
+      chalk.bold('  Portfolio Rebalance'),
+      chalk.dim('  ─────────────────────────────────────────'),
       '',
       `  Status:           ${result.balanced ? chalk.green('BALANCED') : chalk.yellow('IMBALANCED')}`,
       `  Long Exposure:    ${result.longPct.toFixed(1)}%`,

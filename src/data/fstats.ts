@@ -232,7 +232,7 @@ export class FStatsClient implements IDataClient {
   }
 
   async getTraderProfile(address: string): Promise<TraderProfile> {
-    const raw = await safeFetchJson<RawTraderProfile>(`/traders/${address}`);
+    const raw = await safeFetchJson<RawTraderProfile>(`/traders/${encodeURIComponent(address)}`);
     return {
       address: raw?.address ?? address,
       totalTrades: raw?.total_trades ?? 0,

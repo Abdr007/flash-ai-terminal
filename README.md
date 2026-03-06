@@ -1,31 +1,42 @@
 # Flash AI Terminal
 
-**AI-powered quantitative trading terminal for [Flash Trade](https://www.flash.trade/) perpetuals on Solana.**
+**Real-time CLI trading intelligence system for [Flash Trade](https://www.flash.trade/) perpetuals on Solana.**
 
-A CLI trading system that combines market scanning, strategy signals, portfolio management, and risk controls into a single terminal interface. Designed for automated trading experiments with built-in safety rails.
+Flash AI Terminal combines market scanning, strategy signals, regime detection, portfolio management, and risk controls into a single terminal interface. It connects to live blockchain data, runs quantitative analysis, and presents actionable trading intelligence — all from the command line.
 
 ```
-flash [sim] > scan
+  ⚡ FLASH AI TERMINAL ⚡
+  ━━━━━━━━━━━━━━━━━━━━━━━━
 
-  ┌──────────────────────────────────────────────┐
-  │  MARKET SCAN — 9 markets scanned             │
-  ├────────┬───────────┬──────────┬──────────────┤
-  │ Market │ Price     │ Score    │ Signal       │
-  ├────────┼───────────┼──────────┼──────────────┤
-  │ SOL    │ $148.32   │ 0.72     │ LONG         │
-  │ BTC    │ $67,420   │ 0.65     │ LONG         │
-  │ ETH    │ $3,180    │ 0.41     │ NEUTRAL      │
-  └────────┴───────────┴──────────┴──────────────┘
+  SIMULATION MODE
+
+  Balance: $10,000.00
+
+  Market Intelligence
+  ─────────────────────────────────────────
+
+  Regime:    TRENDING
+  Markets:   9 scanned
+
+  Top Opportunities
+    1. SOL    LONG   72%
+    2. BTC    SHORT  65%
+    3. JUP    LONG   58%
+
+  Type "help" for commands, "scan" for opportunities.
+
+flash [sim] >
 ```
 
 ---
 
-## Key Features
+## Features
 
 ### Market Intelligence
-- **Market scanner** across all Flash Trade markets with composite opportunity scoring
+- **Market scanner** — scans all Flash Trade markets with composite opportunity scoring
 - **Regime detection** — classifies markets as trending, ranging, high-volatility, low-liquidity, or whale-dominated
-- **Real-time data** from CoinGecko, Pyth oracles, and on-chain activity
+- **Intelligence screen** — shows market regime, top opportunities, and portfolio status at startup
+- **Real-time data** from CoinGecko, Pyth oracles, fstats.io, and on-chain state
 
 ### Trading Strategies
 - **Momentum** — price direction + volume trend confirmation
@@ -35,26 +46,27 @@ flash [sim] > scan
 ### Portfolio Engine
 - **Position sizing** — Kelly-criterion-inspired allocation with capital limits
 - **Exposure controls** — max 20% per position, 30% per market, 60% directional
-- **Correlation limits** — prevents overconcentration in correlated assets
-- **Rebalancing analysis** — identifies portfolio imbalances
+- **Correlation tracking** — prevents overconcentration in correlated assets
+- **Rebalancing analysis** — identifies portfolio imbalances and suggests actions
 
 ### Risk Management
 - **Liquidation monitoring** — tracks distance to liquidation for all positions
 - **Leverage limits** — enforced per-trade and at portfolio level
 - **Directional exposure caps** — prevents excessive long or short bias
-- **NaN/Infinity guards** — defensive numeric validation throughout
+- **Numeric safety** — NaN/Infinity guards throughout all calculations
 
 ### Automation
-- **Autopilot engine** — automated scan → signal → allocate → execute loop
+- **Autopilot engine** — automated scan → signal → allocate → execute loop (simulation only)
 - **Cooldown protection** — 60s minimum between trades
 - **Duplicate prevention** — won't open positions in markets already held
 - **Risk gating** — every autopilot trade passes allocation + risk checks
 
 ### Infrastructure
-- **CLI terminal** with readline history and fast command dispatch
+- **CLI terminal** with readline history, fast dispatch, and command timeout protection
 - **AI command interpreter** — natural language via Claude, with local regex fallback
-- **Two-tier caching** — 30s market data, 60s analytics
+- **Two-tier caching** — 30s market data, 60s analytics (no redundant RPC calls)
 - **Simulation mode** — full paper trading with live market prices
+- **Strict data integrity** — never trades on fabricated, stale, or missing data
 
 ---
 
@@ -72,8 +84,8 @@ flash [sim] > scan
                     └────────┬────────┘
                              │
                     ┌────────▼────────┐
-                    │   Tool Engine   │
-                    │  (dispatch hub) │
+                    │   Tool Engine    │
+                    │  (dispatch hub)  │
                     └────────┬────────┘
                              │
           ┌──────────────────┼──────────────────┐
@@ -98,36 +110,57 @@ flash [sim] > scan
             ┌────────────────┼────────────────┐
             │                │                │
     ┌───────▼──────┐ ┌──────▼──────┐ ┌───────▼──────┐
-    │  Flash Trade  │ │   CoinGecko │ │  Pyth Oracle │
-    │  (on-chain)   │ │   (prices)  │ │  (prices)    │
+    │  Flash Trade  │ │  CoinGecko  │ │    fstats    │
+    │  (on-chain)   │ │  (prices)   │ │  (analytics) │
     └──────────────┘ └─────────────┘ └──────────────┘
 ```
 
-**Data flows top-down.** User input is parsed into structured intents, dispatched to the appropriate tool, which queries cached on-chain and off-chain data, runs strategy/risk computations, and returns formatted results to the terminal.
+**How data flows:** User input is parsed into structured intents, dispatched to the appropriate tool, which queries cached on-chain and off-chain data, runs strategy and risk computations, and returns formatted results to the terminal.
+
+### Component Overview
+
+| Component | Location | Purpose |
+|---|---|---|
+| **CLI Terminal** | `src/cli/` | Interactive REPL with readline history, fast dispatch, and mode selection |
+| **AI Interpreter** | `src/ai/` | Converts natural language to structured intents (local regex + Claude API) |
+| **Tool Engine** | `src/tools/` | Routes parsed intents to the correct handler |
+| **Market Scanner** | `src/scanner/` | Scans all markets, runs strategies, ranks opportunities by composite score |
+| **Strategy Engine** | `src/strategies/` | Three signal generators: momentum, mean reversion, whale follow |
+| **Regime Detector** | `src/regime/` | Classifies market conditions (trending, ranging, volatile, etc.) |
+| **Portfolio Engine** | `src/portfolio/` | Capital allocation, exposure tracking, rebalancing analysis |
+| **Risk Engine** | `src/risk/` | Liquidation monitoring, exposure analysis, concentration risk |
+| **Autopilot** | `src/automation/` | Automated trading loop with risk gating (simulation only) |
+| **Solana Inspector** | `src/clawd/` | Cached data aggregator wrapping all external data sources |
+| **Flash Client** | `src/client/` | On-chain trading client + simulation client |
+| **Wallet Manager** | `src/wallet/` | Secure wallet storage, import, and connection |
+| **Data Layer** | `src/data/` | CoinGecko price service, fstats.io analytics client |
 
 ---
 
-## Project Structure
+## Command Flow
 
 ```
-src/
-├── cli/            Terminal interface (readline REPL, prompt loop)
-├── ai/             Intent parser (local regex + Claude API fallback)
-├── tools/          Tool engine and tool registry
-├── scanner/        Market opportunity scanner with composite scoring
-├── strategies/     Trading signals (momentum, mean-reversion, whale-follow)
-├── regime/         Market regime detection (trend, volatility, liquidity)
-├── portfolio/      Portfolio manager, allocation engine, rebalancing
-├── risk/           Liquidation risk, exposure analysis
-├── automation/     Autopilot trading loop with risk gating
-├── clawd/          AI agent tools and Solana data inspector
-├── client/         Flash Trade protocol client + simulation client
-├── wallet/         Wallet manager, wallet store (~/.flash/wallets/)
-├── config/         Configuration loader and risk parameters
-├── data/           Price service (CoinGecko) and fstats.io client
-├── types/          TypeScript types, Zod schemas, interfaces
-└── utils/          Formatting, logging, retry utilities
+User Input
+     │
+     ▼
+Fast Dispatch Table ──────── Known command? ──── yes ──→ Tool Engine
+     │                                                        │
+     no                                                       │
+     │                                                        ▼
+     ▼                                                   Execute Tool
+Regex Parser ──── Match? ──── yes ──→ Tool Engine             │
+     │                                                        │
+     no                                                       ▼
+     │                                                  Format Result
+     ▼                                                        │
+Claude AI ──── Parse ──→ Tool Engine                          ▼
+                                                        Display Output
 ```
+
+1. **Fast dispatch** — single-token commands like `scan`, `dashboard`, `positions` skip the interpreter entirely
+2. **Regex parser** — pattern matching for structured commands like `open 5x long SOL $500`
+3. **Claude AI** — natural language fallback for ambiguous inputs (requires API key)
+4. **Tool engine** — executes the parsed intent and returns formatted results
 
 ---
 
@@ -142,72 +175,140 @@ src/
 ### Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/Abdr007/flash-ai-terminal.git
 cd flash-ai-terminal
-
-# Install dependencies
 npm install
-
-# Create your environment file
-cp .env.example .env
-
-# Build the project
 npm run build
+```
 
-# Start the terminal
+### Run
+
+```bash
 npm start
 ```
 
 ### Global Install
 
 ```bash
-npm run build
 npm link
 
 # Now available globally:
-flash --sim       # Simulation mode
-flash --live      # Live trading mode
+flash
 ```
 
-### Quick Start (Simulation Mode)
+### Quick Start
 
-No wallet or API keys needed — simulation mode works out of the box:
+No wallet or API keys needed. Select simulation mode and start exploring:
 
 ```bash
-flash --sim
+flash
 ```
 
-The terminal starts in simulation mode with $10,000 paper balance.
+The terminal opens with a mode selection screen. Choose **Simulation** to start with a $10,000 paper balance using live market prices.
 
 ---
 
-## Configuration
+## Starting the Terminal
 
-Edit `.env` to configure the terminal:
+When you run `flash`, the terminal presents an interactive mode selection:
 
-| Variable | Description | Default |
-|---|---|---|
-| `RPC_URL` | Solana RPC endpoint | `https://api.mainnet-beta.solana.com` |
-| `ANTHROPIC_API_KEY` | Claude API key for AI features | _(empty — local parsing only)_ |
-| `DEFAULT_POOL` | Flash Trade pool | `Crypto.1` |
-| `NETWORK` | Solana network | `mainnet-beta` |
-| `DEFAULT_SLIPPAGE_BPS` | Slippage tolerance (basis points) | `150` |
-| `COMPUTE_UNIT_LIMIT` | Transaction compute budget | `600000` |
-| `COMPUTE_UNIT_PRICE` | Priority fee (microLamports) | `50000` |
+```
+  ⚡ FLASH AI TERMINAL ⚡
+  ━━━━━━━━━━━━━━━━━━━━━━━━
 
-**AI features are optional.** All commands work without an API key using local regex parsing. The AI interpreter adds natural language understanding for ambiguous inputs.
+  Modes Available
 
-**Mode selection** is via CLI flags, not environment variables:
+    1) LIVE TRADING
+       Execute real transactions on Flash Trade.
 
-```bash
-flash --sim       # Simulation mode (default)
-flash --live      # Live trading mode (requires wallet)
+    2) SIMULATION
+       Test strategies using paper trading.
+
+  Select mode:
+
+    1 → Live Trading
+    2 → Simulation
+    3 → Exit
+```
+
+After selecting a mode, the **Flash Intelligence Screen** loads automatically:
+
+- **Market Regime** — the dominant market condition across scanned assets
+- **Top Opportunities** — the 3 highest-scoring trade signals with direction and confidence
+- **Market Coverage** — number of markets scanned
+- **Portfolio Summary** — open positions and unrealized PnL (if any)
+
+This screen uses cached data and loads within seconds. All values are real-time — no synthetic or placeholder data.
+
+---
+
+## Basic Usage
+
+```
+flash
+
+  Select mode:
+    2 → Simulation
+
+flash [sim] > scan
+
+  Market Opportunities
+  ─────────────────────────────────────────
+
+  Rank  Asset   Direction  Confidence  Strategy
+  ───── ─────── ───────── ──────────── ─────────
+  1     SOL     LONG       72%         Momentum
+  2     BTC     SHORT      65%         Mean Reversion
+  3     JUP     LONG       58%         Whale Follow
+
+flash [sim] > analyze SOL
+
+  SOL Market Analysis
+  ─────────────────────────────────────────
+
+  Market Regime
+  TRENDING
+
+  Price
+  $148.32  +3.42%
+
+  Strategy Signals
+
+  Momentum → BULLISH
+  Strong upward price movement with increasing volume.
+
+  Mean Reversion → NEUTRAL
+  Open interest balanced, no significant skew.
+
+  Whale Follow → BULLISH
+  Large positions accumulating on the long side.
+
+  Overall: BULLISH  Confidence: 68%
+
+flash [sim] > open 3x long SOL $500
+
+  Confirm: LONG SOL $500 @ 3x leverage? (yes/no) yes
+
+  Position opened.
+  Entry: $148.32  Size: $1,500.00  Liq: $98.88
+
+flash [sim] > dashboard
 ```
 
 ---
 
-## CLI Commands
+## Core Commands
+
+### Market Intelligence
+
+| Command | Description |
+|---|---|
+| `scan` | Scan all markets for ranked trade opportunities |
+| `analyze <asset>` | Deep market analysis with 3 strategy signals and regime detection |
+| `suggest trade` | AI-powered trade suggestion with reasoning (Claude API key required) |
+| `dashboard` | Combined market, portfolio, and risk overview |
+| `whale activity` | Recent large on-chain positions |
+| `markets` | List all available Flash Trade markets |
 
 ### Trading
 
@@ -219,39 +320,27 @@ flash --live      # Live trading mode (requires wallet)
 | `add $200 to SOL long` | Add collateral to a position |
 | `remove $100 from ETH long` | Remove collateral |
 
+### Portfolio & Risk
+
+| Command | Description |
+|---|---|
+| `portfolio` | Portfolio summary with balance and positions |
+| `positions` | Open positions with unrealized PnL |
+| `portfolio state` | Capital allocation breakdown |
+| `exposure` | Exposure by market and direction |
+| `rebalance` | Portfolio balance analysis with suggested actions |
+| `risk` | Liquidation risk assessment and exposure summary |
+
 ### Market Data
 
 | Command | Description |
 |---|---|
-| `markets` | Show all Flash Trade markets with pool mapping |
-| `SOL price` | Get a specific market price |
 | `volume` | Trading volume data |
-| `open interest` | Open interest across markets |
+| `open interest` / `oi` | Open interest across markets |
 | `leaderboard` | Top traders by PnL |
 | `fees` | Protocol fee data |
 
-### AI Agent
-
-| Command | Description |
-|---|---|
-| `scan` | Scan all markets for opportunities |
-| `analyze SOL` | Deep market analysis with 3 strategy signals |
-| `suggest trade` | AI-powered trade suggestion (requires API key) |
-| `risk report` | Position risk assessment + exposure summary |
-| `dashboard` | Combined portfolio / market / stats view |
-| `whale activity` | Recent large on-chain positions |
-
-### Portfolio Intelligence
-
-| Command | Description |
-|---|---|
-| `portfolio` | Portfolio summary |
-| `positions` | Open positions with P&L |
-| `portfolio state` | Capital allocation breakdown |
-| `portfolio exposure` | Exposure by market and direction |
-| `rebalance` | Analyze portfolio balance |
-
-### Autopilot
+### Autopilot (Simulation Only)
 
 | Command | Description |
 |---|---|
@@ -264,108 +353,50 @@ flash --live      # Live trading mode (requires wallet)
 | Command | Description |
 |---|---|
 | `wallet` | Show wallet connection status |
-| `wallet import <name> <path>` | Import and store a wallet from keypair file |
 | `wallet list` | List all stored wallets |
-| `wallet use <name>` | Switch to a stored wallet |
-| `wallet remove <name>` | Remove a stored wallet |
-| `wallet connect <path>` | Connect a wallet (one-time, not stored) |
 | `wallet address` | Show connected wallet address |
 | `wallet balance` | Show SOL balance |
-| `wallet tokens` | Detect all tokens in wallet |
+| `wallet tokens` | Show all token balances |
 
 ---
 
-## Runtime Modes
+## Configuration
 
-Flash AI Terminal uses explicit CLI flags for mode selection. No environment variable guessing.
+Create a `.env` file in the project root or at `~/.flash/.env`:
 
-```bash
-flash --sim       # Simulation mode (paper trading, $10,000 balance)
-flash --live      # Live trading (requires wallet)
-flash             # Defaults to simulation
-```
+| Variable | Description | Default |
+|---|---|---|
+| `RPC_URL` | Solana RPC endpoint | `https://api.mainnet-beta.solana.com` |
+| `ANTHROPIC_API_KEY` | Claude API key for AI features | _(empty — local parsing only)_ |
+| `DEFAULT_POOL` | Flash Trade pool | `Crypto.1` |
+| `NETWORK` | Solana network | `mainnet-beta` |
+| `DEFAULT_SLIPPAGE_BPS` | Slippage tolerance (basis points) | `150` |
+| `COMPUTE_UNIT_LIMIT` | Transaction compute budget | `600000` |
+| `COMPUTE_UNIT_PRICE` | Priority fee (microLamports) | `50000` |
+| `LOG_FILE` | Log file path | _(none)_ |
 
-| Flag | Behavior |
+**AI features are optional.** All commands work without an API key using local regex parsing. The Claude interpreter adds natural language understanding for ambiguous inputs.
+
+---
+
+## Available Markets
+
+| Pool | Markets |
 |---|---|
-| `--sim` | Uses `SimulatedFlashClient` — paper trading with live market prices |
-| `--live` | Uses `FlashClient` — real on-chain transactions (requires wallet) |
-| _(none)_ | Defaults to `--sim` |
-
-### Live Mode Wallet Gate
-
-Running `flash --live` without a wallet **never silently falls back** to simulation. Instead, an interactive menu appears:
-
-```
-LIVE TRADING MODE
-
-No wallet connected.
-
-Choose an option:
-
-  1  wallet import
-  2  wallet connect <path>
-  3  continue in simulation
-  4  exit
-```
-
-The user must explicitly choose. This prevents accidental mode switches.
-
-### Wallet Storage
-
-Imported wallets are stored at `~/.flash/wallets/<name>.json` with `0600` permissions. The last-used wallet auto-loads on startup.
-
-```bash
-# Import a wallet (private key input is hidden — never echoed)
-flash [live] > wallet import main ~/.config/solana/id.json
-
-# List stored wallets
-flash [live] > wallet list
-
-# Switch wallets
-flash [live] > wallet use trading-wallet
-```
-
----
-
-## Example Workflow
-
-```bash
-# Start the terminal (simulation mode)
-flash --sim
-
-# Check what's available
-flash [sim] > help
-
-# Scan markets for opportunities
-flash [sim] > scan
-
-# Analyze the top opportunity
-flash [sim] > analyze SOL
-
-# Check your risk before trading
-flash [sim] > risk report
-
-# Open a position
-flash [sim] > open 5x long SOL $500
-
-# Monitor your portfolio
-flash [sim] > dashboard
-
-# Or let the autopilot handle it
-flash [sim] > autopilot start
-
-# Check autopilot status
-flash [sim] > autopilot status
-
-# Stop when done
-flash [sim] > autopilot stop
-```
+| **Crypto.1** | SOL, BTC, ETH, ZEC, BNB |
+| **Virtual.1** | XAG, XAU, CRUDEOIL, EUR, GBP, USDJPY, USDCNH |
+| **Governance.1** | JTO, JUP, PYTH, RAY, HYPE, MET, KMNO |
+| **Community.1** | PUMP, BONK, PENGU |
+| **Community.2** | WIF |
+| **Trump.1** | FARTCOIN |
+| **Ore.1** | ORE |
+| **Remora.1** | TSLAr, MSTRr, CRCLr, NVDAr, SPYr |
 
 ---
 
 ## Data Sources
 
-All market data is **live and real-time**. No hardcoded prices or fabricated data.
+All market data is live and real-time. No hardcoded prices or fabricated values.
 
 | Source | Data |
 |---|---|
@@ -373,34 +404,86 @@ All market data is **live and real-time**. No hardcoded prices or fabricated dat
 | **Pyth Network** | Oracle prices for on-chain execution |
 | **Flash Trade** | On-chain positions, pool data, protocol state |
 | **fstats.io** | Volume, open interest, leaderboard, whale activity |
-| **Solana RPC** | Wallet balance, transaction submission |
-
-If any data source is unavailable, the system degrades gracefully — it will never trade on stale or missing data.
+| **Solana RPC** | Wallet balances, transaction submission |
 
 ---
 
-## Safety
+## Data Integrity Policy
 
-> **This software is experimental. Use at your own risk.**
+Flash AI Terminal enforces a strict real-data policy:
 
-Built-in safety measures:
+- **No fallback prices.** If price data is unavailable for a market, that market is excluded from scanning and trading. The system will never substitute a hardcoded or estimated price.
+- **No fabricated signals.** Strategy signals are computed from live market data. If upstream data is missing, the signal returns neutral rather than guessing.
+- **No synthetic balances.** Portfolio and wallet balances reflect actual state. Simulation mode uses a tracked paper balance — never an invented number.
+- **Graceful degradation.** When a data source fails, the system continues with reduced coverage rather than generating fake data. Affected sections display "Data unavailable" instead of zeros or estimates.
 
-- **Simulation by default** — `flash --sim` is the default; live trading requires explicit `flash --live` plus a connected wallet
-- **No silent mode switches** — `flash --live` without a wallet shows an interactive menu, never auto-falls back
-- **5-layer autopilot guard** — autopilot is blocked in live mode at dispatch, tool mapping, tool execute, engine start, and engine cycle levels
-- **Secure key handling** — private key input is hidden (no echo), keys are zeroed from memory after use, wallet files stored with `0600` permissions
-- **Risk gating** — every trade (manual or autopilot) passes position sizing, leverage, and exposure checks
-- **Liquidation monitoring** — continuous distance-to-liquidation tracking
-- **Autopilot limits** — max $1,000/position, max $2,000 total exposure, max 5x leverage, 60s cooldown
-- **Portfolio limits** — max 20% per position, 30% per market, 60% directional, 5 positions
-- **HTTPS enforcement** — RPC and oracle connections require HTTPS
-- **No hardcoded prices** — prevents trading on stale data if APIs fail
+This policy exists because traders make financial decisions based on system output. Showing fabricated data, even as a fallback, can lead to real losses.
 
-**Recommendations:**
-1. Start with simulation mode to understand the system
-2. Review `risk report` and `portfolio exposure` before enabling autopilot
-3. Use a dedicated wallet with limited funds for live trading
-4. Monitor the terminal — autopilot is not a "set and forget" system
+---
+
+## Security
+
+### Wallet Protection
+- Private key input is hidden during import (no terminal echo)
+- Keys are zeroed from memory immediately after use
+- Wallet files stored at `~/.flash/wallets/` with `0600` permissions (owner-only read/write)
+- Path traversal protection with symlink resolution on all file operations
+
+### Mode Safety
+- Mode is locked for the entire session after selection — no runtime switching
+- Live trading requires explicit mode selection + wallet connection
+- Autopilot is blocked in live mode at multiple enforcement layers
+
+### Network Security
+- RPC and API connections use HTTPS
+- URL path parameters are encoded to prevent injection
+- User-provided file paths are validated and resolved before access
+
+### Trading Safety
+- All trades validated against leverage limits, balance checks, and position sizing rules
+- Confirmation prompt before every trade execution
+- 30-second command timeout prevents hung operations
+- Division-by-zero and NaN guards on all financial calculations
+
+---
+
+## Project Structure
+
+```
+src/
+├── cli/            Terminal interface (readline REPL, mode selection, intelligence screen)
+├── ai/             Intent parser (local regex + Claude API fallback)
+├── tools/          Tool engine, tool definitions, and dispatch registry
+├── scanner/        Market opportunity scanner with composite scoring
+├── strategies/     Trading signals (momentum, mean-reversion, whale-follow)
+├── regime/         Market regime detection (trend, volatility, liquidity, whale activity)
+├── portfolio/      Portfolio manager, allocation engine, correlation tracking, rebalancing
+├── risk/           Liquidation risk assessment, exposure analysis
+├── automation/     Autopilot trading loop with risk gating
+├── clawd/          AI agent tools and Solana data inspector (cached aggregator)
+├── client/         Flash Trade protocol client + simulation client
+├── wallet/         Wallet manager, secure wallet store (~/.flash/wallets/)
+├── config/         Configuration loader, pool/market definitions, risk parameters
+├── data/           CoinGecko price service, fstats.io analytics client
+├── types/          TypeScript types, Zod schemas, domain interfaces
+└── utils/          Formatting, logging, retry utilities
+```
+
+---
+
+## Design Philosophy
+
+Flash AI Terminal follows these principles:
+
+**Real data over estimates.** Every number displayed comes from a live data source. If data is unavailable, the system says so rather than guessing.
+
+**Transparency over black boxes.** Every trade suggestion includes the strategy signals, confidence scores, and reasoning that produced it. Traders see exactly why the system recommends an action.
+
+**Safety by default.** Simulation mode is the starting point. Live trading requires deliberate setup. Autopilot is restricted to simulation. Every trade requires confirmation.
+
+**Simple workflows.** One command to scan markets. One command to analyze an asset. One command to see your risk. No configuration files to study before getting started.
+
+**Developer-friendly architecture.** Pure functions for strategy computation. Clean interfaces between layers. Cached data access to minimize RPC load. Type safety throughout.
 
 ---
 
@@ -410,7 +493,7 @@ Built-in safety measures:
 # Build
 npm run build
 
-# Development mode (tsx, no build needed)
+# Development mode (tsx, no build step)
 npm run dev
 
 # Type check
@@ -425,12 +508,14 @@ npm test
 Strategies are pure functions in `src/strategies/`. Each takes market data and returns a `StrategySignal`:
 
 ```typescript
-export function computeMySignal(data: MarketInput): StrategySignal {
+import { StrategySignal } from '../types/index.js';
+
+export function computeMySignal(data: { market: MarketData; volume: VolumeData }): StrategySignal {
   return {
-    direction: 'long' | 'short' | 'neutral',
-    confidence: 0.0 - 1.0,
-    label: 'My Strategy',
-    reasoning: 'Why this signal was generated',
+    name: 'My Strategy',
+    signal: 'bullish',       // 'bullish' | 'bearish' | 'neutral'
+    confidence: 0.65,        // 0.0 to 1.0
+    reasoning: 'Explanation of why this signal was generated.',
   };
 }
 ```
@@ -440,36 +525,50 @@ Register it in `src/scanner/market-scanner.ts` to include it in the scan pipelin
 ### Adding a New Command
 
 1. Add an `ActionType` enum value in `src/types/index.ts`
-2. Add a regex pattern in `src/ai/interpreter.ts` → `localParse()`
-3. Create a tool definition in `src/tools/` or `src/clawd/`
-4. Add a dispatch case in `src/tools/engine.ts`
-
----
-
-## Available Markets
-
-| Pool | Markets |
-|---|---|
-| **Crypto.1** | SOL, BTC, ETH, ZEC, BNB |
-| **Virtual.1** | XAG, XAU, CRUDEOIL, EUR, GBP, USDJPY, USDCNH |
-| **Governance.1** | JTO, JUP, PYTH, RAY, HYPE, MET, KMNO |
-| **Community.1** | PUMP, BONK, PENGU |
-| **Community.2** | WIF |
-| **Remora.1** | TSLAr, MSTRr, CRCLr, NVDAr, SPYr |
+2. Add a Zod schema for the intent
+3. Add a regex pattern in `src/ai/interpreter.ts`
+4. Create a tool definition in `src/tools/` or `src/clawd/`
+5. Add a dispatch case in `src/tools/engine.ts`
+6. Optionally add to `FAST_DISPATCH` in `src/cli/terminal.ts` for single-token commands
 
 ---
 
 ## Tech Stack
 
-- **TypeScript** — strict mode, ESM modules
-- **Solana web3.js** — blockchain interaction
-- **Flash SDK** — Flash Trade protocol integration
-- **Anchor** — Solana program framework
-- **Pyth Client** — oracle price feeds
-- **Anthropic SDK** — Claude AI for natural language parsing
-- **Zod** — runtime type validation
-- **Commander** — CLI framework
-- **Chalk** — terminal styling
+| Technology | Role |
+|---|---|
+| **TypeScript** | Strict mode, ESM modules |
+| **Solana web3.js** | Blockchain interaction |
+| **Flash SDK** | Flash Trade protocol integration |
+| **Anchor** | Solana program framework |
+| **Pyth Client** | Oracle price feeds |
+| **Anthropic SDK** | Claude AI for natural language parsing |
+| **Zod** | Runtime schema validation |
+| **Commander** | CLI framework |
+| **Chalk** | Terminal styling |
+
+---
+
+## Contributing
+
+Contributions are welcome.
+
+- **Report bugs** — open an issue with steps to reproduce
+- **Suggest features** — describe the use case and expected behavior
+- **Submit pull requests** — fork the repo, make changes, and open a PR against `main`
+
+When contributing code:
+- Run `npm run build` and `npm test` before submitting
+- Follow the existing code style (strict TypeScript, ESM imports, pure functions where possible)
+- Do not add synthetic data or hardcoded fallback values
+
+---
+
+## Disclaimer
+
+> **This software is experimental. Use at your own risk.**
+>
+> Flash AI Terminal is a research and trading tool. It does not constitute financial advice. Trading perpetual futures involves significant risk of loss. Always start with simulation mode, use dedicated wallets with limited funds, and never trade more than you can afford to lose.
 
 ---
 
