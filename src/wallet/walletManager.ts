@@ -16,8 +16,19 @@ export class WalletManager {
     this.connection = connection;
   }
 
+  /** True if a keypair is loaded (can sign transactions) */
   get isConnected(): boolean {
     return this.keypair !== null;
+  }
+
+  /** True if at least a public key is set (read-only or full access) */
+  get hasAddress(): boolean {
+    return this.publicKey !== null;
+  }
+
+  /** True if only an address is connected (no signing capability) */
+  get isReadOnly(): boolean {
+    return this.publicKey !== null && this.keypair === null;
   }
 
   get address(): string | null {
@@ -107,6 +118,33 @@ export class WalletManager {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Connect a wallet by public key (address) for read-only access.
+   * Can view balances and positions but cannot sign transactions.
+   */
+  connectAddress(address: string): { address: string } {
+    const logger = getLogger();
+
+    let pubkey: PublicKey;
+    try {
+      pubkey = new PublicKey(address);
+    } catch {
+      throw new Error(`Invalid Solana address: ${address}`);
+    }
+
+    // Validate it's on the ed25519 curve (real address, not a program ID)
+    if (!PublicKey.isOnCurve(pubkey.toBytes())) {
+      throw new Error(`Address is not a valid wallet (off-curve): ${address}`);
+    }
+
+    this.publicKey = pubkey;
+    this.keypair = null; // Read-only — no signing
+
+    const addr = pubkey.toBase58();
+    logger.debug('Wallet', `Connected address (read-only): ${addr}`);
+    return { address: addr };
   }
 
   /**

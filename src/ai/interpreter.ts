@@ -273,15 +273,15 @@ export function localParse(input: string): ParsedIntent | null {
 
   // ─── Autopilot Commands ─────────────────────────────────────────────────
 
-  if (/^autopilot\s+start$/.test(lower)) {
+  if (/^(?:autopilot\s+start|start\s+autopilot)$/.test(lower)) {
     return { action: ActionType.AutopilotStart };
   }
 
-  if (/^autopilot\s+stop$/.test(lower)) {
+  if (/^(?:autopilot\s+stop|stop\s+autopilot)$/.test(lower)) {
     return { action: ActionType.AutopilotStop };
   }
 
-  if (/^autopilot\s+(status|info)$/.test(lower)) {
+  if (/^(?:autopilot\s+(?:status|info)|autopilot)$/.test(lower)) {
     return { action: ActionType.AutopilotStatus };
   }
 

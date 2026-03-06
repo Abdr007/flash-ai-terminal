@@ -1,5 +1,5 @@
 import { createInterface, Interface } from 'readline';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import chalk from 'chalk';
@@ -91,27 +91,61 @@ export class FlashTerminal {
     // Phase 10: Startup safety checks
     this.validateStartup();
 
-    const walletInfo = this.walletManager.tryDetect(this.config.walletPath);
-    const connection = createConnection(this.config.rpcUrl);
+    // Create readline early — needed for wallet prompt
+    this.rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      historySize: MAX_HISTORY,
+    });
 
-    // Initialize client (simulation or real)
-    if (this.config.simulationMode) {
+    this.loadHistory();
+
+    // Print banner
+    console.log(banner());
+
+    // ─── Wallet Detection & Connection ───────────────────────────────────
+    let walletInfo: { address: string } | null = null;
+    const walletPath = this.config.walletPath;
+    const walletExists = existsSync(walletPath);
+
+    if (walletExists) {
+      console.log(chalk.cyan(`\n  Wallet detected: ${walletPath}`));
+      const answer = await this.ask(`  ${chalk.yellow('Connect this wallet?')} ${chalk.dim('(yes/no)')} `);
+
+      if (answer.toLowerCase() === 'yes' || answer.toLowerCase() === 'y') {
+        walletInfo = this.tryConnectWallet(walletPath);
+      }
+    } else {
+      console.log(chalk.dim(`\n  No wallet found at ${walletPath}`));
+    }
+
+    // If no wallet connected yet, ask for address or path
+    if (!walletInfo) {
+      walletInfo = await this.walletConnectionFlow();
+    }
+
+    // ─── Initialize Client ───────────────────────────────────────────────
+    const connection = createConnection(this.config.rpcUrl);
+    const canSign = this.walletManager.isConnected; // has keypair, not just address
+
+    if (this.config.simulationMode || !walletInfo || !canSign) {
+      // Simulation mode: no keypair, read-only address, or explicitly requested
+      if (!this.config.simulationMode && walletInfo && !canSign) {
+        console.log(chalk.yellow('  Read-only wallet — using simulation mode for trades.'));
+      } else if (!this.config.simulationMode && !walletInfo) {
+        console.log(chalk.yellow('  No wallet connected. Falling back to simulation mode.'));
+      }
+      this.config.simulationMode = true;
       this.flashClient = new SimulatedFlashClient(10_000);
     } else {
-      if (!walletInfo) {
-        console.log(chalk.yellow('  No wallet found at ' + this.config.walletPath + '. Falling back to simulation mode.'));
+      try {
+        const { FlashClient } = await import('../client/flash-client.js');
+        this.flashClient = new FlashClient(connection, this.walletManager, this.config);
+      } catch (error: unknown) {
+        console.log(chalk.red(`  Failed to initialize live client: ${getErrorMessage(error)}`));
+        console.log(chalk.yellow('  Falling back to simulation mode.'));
         this.config.simulationMode = true;
         this.flashClient = new SimulatedFlashClient(10_000);
-      } else {
-        try {
-          const { FlashClient } = await import('../client/flash-client.js');
-          this.flashClient = new FlashClient(connection, this.walletManager, this.config);
-        } catch (error: unknown) {
-          console.log(chalk.red(`  Failed to initialize live client: ${getErrorMessage(error)}`));
-          console.log(chalk.yellow('  Falling back to simulation mode.'));
-          this.config.simulationMode = true;
-          this.flashClient = new SimulatedFlashClient(10_000);
-        }
       }
     }
 
@@ -127,76 +161,11 @@ export class FlashTerminal {
     setClawdApiKey(this.config.anthropicApiKey);
     this.engine = new ToolEngine(this.context);
 
-    // Phase 2 & 5: Create readline with history support
-    this.rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      historySize: MAX_HISTORY,
-    });
-
-    // Phase 5: Load persistent history
-    this.loadHistory();
-
-    // Phase 2: Set prompt string
+    // Set prompt based on mode
     this.updatePrompt();
 
-    // Phase 9: Graceful exit on EOF / terminal close
-    this.rl.on('close', () => {
-      this.shutdown();
-    });
-
-    // Phase 1: Event-based line handler (replaces recursive rl.question)
-    this.rl.on('line', async (line) => {
-      // Phase 8: If waiting for confirmation, route to confirmation handler
-      if (this.pendingConfirmation) {
-        const cb = this.pendingConfirmation;
-        this.pendingConfirmation = null;
-        cb(line);
-        return;
-      }
-
-      const trimmed = line.trim();
-
-      // Phase 7: Reject empty input
-      if (!trimmed) {
-        this.rl.prompt();
-        return;
-      }
-
-      // Phase 7: Input length limit
-      if (trimmed.length > 1000) {
-        console.log(chalk.red('  Input too long (max 1000 characters).'));
-        this.rl.prompt();
-        return;
-      }
-
-      // Phase 9: Exit commands
-      const lower = trimmed.toLowerCase();
-      if (lower === 'exit' || lower === 'quit') {
-        this.shutdown();
-        return;
-      }
-
-      // Phase 8: Block concurrent commands
-      if (this.processing) {
-        console.log(chalk.dim('  Please wait for the current command to finish.'));
-        return;
-      }
-
-      this.processing = true;
-      try {
-        await this.handleInput(trimmed);
-      } catch (error: unknown) {
-        console.log(chalk.red(`  Error: ${getErrorMessage(error)}`));
-      } finally {
-        this.processing = false;
-        this.rl.prompt();
-      }
-    });
-
-    // Print banner
-    console.log(banner());
-
+    // ─── Display Status ──────────────────────────────────────────────────
+    console.log('');
     if (this.config.simulationMode) {
       const modeTag = chalk.bgYellow.black(' SIMULATION ');
       console.log(`  ${modeTag} ${chalk.dim('Pool:')} ${chalk.bold(this.config.defaultPool)}`);
@@ -225,8 +194,122 @@ export class FlashTerminal {
 
     console.log(chalk.dim('\n  Type "help" for commands, "exit" to quit.\n'));
 
-    // Phase 2: Show initial prompt
+    // ─── Start Line Handler ──────────────────────────────────────────────
+    this.rl.on('close', () => {
+      this.shutdown();
+    });
+
+    this.rl.on('line', async (line) => {
+      if (this.pendingConfirmation) {
+        const cb = this.pendingConfirmation;
+        this.pendingConfirmation = null;
+        cb(line);
+        return;
+      }
+
+      const trimmed = line.trim();
+
+      if (!trimmed) {
+        this.rl.prompt();
+        return;
+      }
+
+      if (trimmed.length > 1000) {
+        console.log(chalk.red('  Input too long (max 1000 characters).'));
+        this.rl.prompt();
+        return;
+      }
+
+      const lower = trimmed.toLowerCase();
+      if (lower === 'exit' || lower === 'quit') {
+        this.shutdown();
+        return;
+      }
+
+      if (this.processing) {
+        console.log(chalk.dim('  Please wait for the current command to finish.'));
+        return;
+      }
+
+      this.processing = true;
+      try {
+        await this.handleInput(trimmed);
+      } catch (error: unknown) {
+        console.log(chalk.red(`  Error: ${getErrorMessage(error)}`));
+      } finally {
+        this.processing = false;
+        this.rl.prompt();
+      }
+    });
+
     this.rl.prompt();
+  }
+
+  /** One-shot question (used for wallet prompt before line handler is active) */
+  private ask(question: string): Promise<string> {
+    return new Promise((resolve) => {
+      this.rl.question(question, resolve);
+    });
+  }
+
+  /** Try to connect a wallet from a file path. Returns info on success, null on failure. */
+  private tryConnectWallet(path: string): { address: string } | null {
+    try {
+      const result = this.walletManager.loadFromFile(path);
+      console.log(chalk.green(`  Connected: ${result.address}`));
+      return { address: result.address };
+    } catch (error: unknown) {
+      console.log(chalk.red(`  Failed to load wallet: ${getErrorMessage(error)}`));
+      return null;
+    }
+  }
+
+  /**
+   * Interactive wallet connection flow.
+   * Accepts address or keypair path. If address given, asks for keypair for live trading.
+   */
+  private async walletConnectionFlow(): Promise<{ address: string } | null> {
+    const input = (await this.ask(
+      `  ${chalk.yellow('Enter wallet address or keypair path')} ${chalk.dim('(Enter for simulation)')} `,
+    )).trim();
+
+    if (!input) {
+      console.log(chalk.dim('  Starting in simulation mode.\n'));
+      return null;
+    }
+
+    // Check if input looks like a Solana address (base58, 32-44 chars)
+    const looksLikeAddress = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(input);
+
+    if (!looksLikeAddress) {
+      // It's a file path — try full keypair connection
+      return this.tryConnectWallet(input);
+    }
+
+    // It's a wallet address — connect read-only first
+    try {
+      this.walletManager.connectAddress(input);
+    } catch (error: unknown) {
+      console.log(chalk.red(`  Invalid address: ${getErrorMessage(error)}`));
+      return null;
+    }
+
+    console.log(chalk.green(`  Wallet identified: ${input}`));
+
+    // Now ask for the keypair file to enable live trading
+    console.log(chalk.dim('  Live trading requires a keypair file to sign transactions.'));
+    const keypairPath = (await this.ask(
+      `  ${chalk.yellow('Enter keypair file path')} ${chalk.dim('(Enter for simulation with this wallet)')} `,
+    )).trim();
+
+    if (keypairPath) {
+      const result = this.tryConnectWallet(keypairPath);
+      if (result) return result;
+    }
+
+    // No keypair — keep address for read-only (balance lookups), simulation for trades
+    console.log(chalk.dim('  No keypair provided — simulation mode with wallet view.\n'));
+    return { address: input };
   }
 
   /** Phase 2: Update prompt prefix based on current mode */

@@ -71,11 +71,10 @@ export class PriceService {
       logger.warn('PRICE', `CoinGecko fetch failed: ${getErrorMessage(error)}`);
     }
 
-    // Log missing symbols — no fallback prices used
-    for (const sym of uncached) {
-      if (!priceMap.has(sym)) {
-        logger.warn('PRICE', `No live price available for ${sym} — market will be excluded from analysis`);
-      }
+    // Log missing symbols — one summary line instead of per-market spam
+    const missing = uncached.filter(sym => !priceMap.has(sym));
+    if (missing.length > 0) {
+      logger.warn('PRICE', `No live price for ${missing.length} market(s): ${missing.join(', ')} — excluded from analysis`);
     }
 
     return priceMap;
