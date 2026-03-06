@@ -30,6 +30,7 @@
     "@pythnetwork/client": "^2.22.0",
     "@solana/spl-token": "^0.4.13",
     "@solana/web3.js": "^1.98.2",
+    "bs58": "^5.0.0",
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "dotenv": "^16.4.7",

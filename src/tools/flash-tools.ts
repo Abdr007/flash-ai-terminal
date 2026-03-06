@@ -688,6 +688,23 @@ export const walletImport: ToolDefinition = {
   }),
   execute: async (params, context): Promise<ToolResult> => {
     const { name, path } = params as { name: string; path: string };
+
+    if (!name || !path) {
+      return {
+        success: true,
+        message: [
+          '',
+          chalk.bold('  Import Wallet'),
+          chalk.dim('  ─────────────────'),
+          '',
+          `  Usage: ${chalk.cyan('wallet import <name> <path>')}`,
+          '',
+          `  Example: ${chalk.dim('wallet import main ~/.config/solana/id.json')}`,
+          '',
+        ].join('\n'),
+      };
+    }
+
     let secretKey: number[] | undefined;
     try {
       // Path validation: restrict to home directory, resolve symlinks

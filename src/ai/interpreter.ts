@@ -120,6 +120,10 @@ export function localParse(input: string): ParsedIntent | null {
   if (walletImportMatch) {
     return { action: ActionType.WalletImport, name: walletImportMatch[1], path: walletImportMatch[2].trim() };
   }
+  // Bare "wallet import" without args — route to import tool with empty params so it shows usage
+  if (/^wallet\s+import$/.test(lower)) {
+    return { action: ActionType.WalletImport, name: '', path: '' };
+  }
   if (/^wallet\s+list$/.test(lower)) {
     return { action: ActionType.WalletList };
   }

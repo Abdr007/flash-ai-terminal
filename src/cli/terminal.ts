@@ -696,13 +696,14 @@ export class FlashTerminal {
   }
 
   /**
-   * Interactive wallet import: prompts for name and private key array,
-   * validates, stores to ~/.flash/wallets/, and connects.
+   * Interactive wallet import: prompts for name and private key,
+   * accepts base58 string, JSON array, or file path.
+   * Stores to ~/.flash/wallets/ and connects.
    */
   private async handleWalletImportFlow(store: WalletStore): Promise<string | null> {
     console.log('');
 
-    const name = (await this.ask(`  ${chalk.yellow('Enter wallet name:')} `)).trim();
+    const name = (await this.ask(`  ${chalk.yellow('Wallet name:')} `)).trim();
     if (!name) {
       console.log(chalk.red('  Wallet name cannot be empty.'));
       return null;
@@ -713,29 +714,70 @@ export class FlashTerminal {
       return null;
     }
 
-    console.log(chalk.dim('  Paste Solana private key (input hidden):'));
+    console.log('');
+    console.log(chalk.dim('  Paste your private key (base58 or JSON array)'));
+    console.log(chalk.dim('  or enter path to wallet JSON file.'));
+    console.log(chalk.dim('  Input is hidden for security.'));
     const keyInput = await this.readHidden(`  ${chalk.yellow('>')} `);
 
     if (!keyInput) {
-      console.log(chalk.red('  No key provided.'));
+      console.log(chalk.red('  No input provided.'));
       return null;
     }
 
     let secretKey: number[] | undefined;
-    try {
-      const parsed: unknown = JSON.parse(keyInput);
-      if (!Array.isArray(parsed)) {
-        console.log(chalk.red('  Invalid key format. Expected JSON array of 64 numbers.'));
+    const trimmed = keyInput.trim();
+
+    // Try JSON array first (e.g. [1,2,3,...])
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          secretKey = parsed as number[];
+        }
+      } catch {
+        // Not valid JSON array
+      }
+    }
+
+    // Try as a file path (e.g. ~/.config/solana/id.json)
+    if (!secretKey && (trimmed.startsWith('/') || trimmed.startsWith('~') || trimmed.startsWith('.'))) {
+      try {
+        const expandedPath = trimmed.startsWith('~')
+          ? join(homedir(), trimmed.slice(1))
+          : resolve(trimmed);
+        if (existsSync(expandedPath)) {
+          const raw = readFileSync(expandedPath, 'utf-8');
+          const parsed: unknown = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            secretKey = parsed as number[];
+          }
+        }
+      } catch {
+        // Not a valid file
+      }
+    }
+
+    // Try base58 decode (Phantom/Solflare export format)
+    if (!secretKey) {
+      try {
+        const bs58 = await import('bs58');
+        const decoded = bs58.default.decode(trimmed);
+        if (decoded.length === 64) {
+          secretKey = Array.from(decoded);
+        } else {
+          console.log(chalk.red(`  Invalid key length: expected 64 bytes, got ${decoded.length}.`));
+          return null;
+        }
+      } catch {
+        console.log(chalk.red('  Invalid key format.'));
+        console.log(chalk.dim('  Accepted: base58 string, JSON array [1,2,...], or file path.'));
         return null;
       }
-      secretKey = parsed as number[];
-    } catch {
-      console.log(chalk.red('  Invalid key format. Expected JSON array of 64 numbers.'));
-      return null;
     }
 
     try {
-      const result = store.importWallet(name, secretKey);
+      const result = store.importWallet(name, secretKey!);
       store.setDefault(name);
 
       // Connect the wallet
