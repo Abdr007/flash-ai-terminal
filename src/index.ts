@@ -105,4 +105,127 @@ program
     }
   });
 
+program
+  .command('doctor')
+  .description('Check system environment and connectivity')
+  .action(async () => {
+    const config = loadConfig();
+
+    console.log('');
+    console.log(chalk.bold('  FLASH AI TERMINAL DIAGNOSTICS'));
+    console.log(chalk.yellow('  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+    console.log('');
+
+    const label = (name: string) => `  ${name.padEnd(23)}`;
+    const ok = (msg: string) => chalk.green(`✓ ${msg}`);
+    const warn = (msg: string) => chalk.yellow(`⚠ ${msg}`);
+    const fail = (msg: string) => chalk.red(`✗ ${msg}`);
+
+    let allOk = true;
+
+    // 1. Node.js version
+    const nodeVersion = process.versions.node;
+    const major = parseInt(nodeVersion.split('.')[0], 10);
+    if (major >= 18) {
+      console.log(label('Node.js version') + ok(`v${nodeVersion}`));
+    } else {
+      console.log(label('Node.js version') + fail(`v${nodeVersion} (requires >= 18)`));
+      allOk = false;
+    }
+
+    // 2. RPC connection
+    if (!config.rpcUrl) {
+      console.log(label('RPC connection') + fail('RPC_URL not configured'));
+      allOk = false;
+    } else {
+      try {
+        const res = await fetch(config.rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
+          signal: AbortSignal.timeout(5000),
+        });
+        const data = await res.json() as { result?: string };
+        if (data.result === 'ok') {
+          console.log(label('RPC connection') + ok('Connected'));
+        } else {
+          console.log(label('RPC connection') + warn('Reachable but unhealthy'));
+        }
+      } catch {
+        console.log(label('RPC connection') + fail('Unreachable'));
+        allOk = false;
+      }
+    }
+
+    // 3. Market data
+    try {
+      const { PriceService } = await import('./data/prices.js');
+      const ps = new PriceService();
+      const prices = await ps.getPrices(['SOL']);
+      const solPrice = prices.get('SOL');
+      if (solPrice && solPrice.price > 0) {
+        console.log(label('Market data') + ok('Live data available'));
+      } else {
+        console.log(label('Market data') + warn('No price data returned'));
+      }
+    } catch {
+      console.log(label('Market data') + fail('Unable to fetch prices'));
+      allOk = false;
+    }
+
+    // 4. fstats.io connectivity
+    try {
+      const { FStatsClient } = await import('./data/fstats.js');
+      const fstats = new FStatsClient();
+      const stats = await fstats.getOverviewStats();
+      if (stats.trades > 0) {
+        console.log(label('Flash Trade data') + ok('Connected'));
+      } else {
+        console.log(label('Flash Trade data') + warn('No data returned'));
+      }
+    } catch {
+      console.log(label('Flash Trade data') + fail('Unable to reach fstats.io'));
+      allOk = false;
+    }
+
+    // 5. AI provider
+    const hasAnthropic = !!config.anthropicApiKey && config.anthropicApiKey !== 'sk-ant-...';
+    const hasGroq = !!config.groqApiKey;
+    if (hasAnthropic && hasGroq) {
+      console.log(label('AI provider') + ok('Claude + Groq'));
+    } else if (hasAnthropic) {
+      console.log(label('AI provider') + ok('Claude'));
+    } else if (hasGroq) {
+      console.log(label('AI provider') + ok('Groq'));
+    } else {
+      console.log(label('AI provider') + warn('None (local parsing only)'));
+    }
+
+    // 6. Wallet
+    try {
+      const { WalletStore } = await import('./wallet/wallet-store.js');
+      const store = new WalletStore();
+      const wallets = store.listWallets();
+      const defaultWallet = store.getDefault();
+      if (defaultWallet) {
+        console.log(label('Wallet') + ok(`Default: ${defaultWallet}`));
+      } else if (wallets.length > 0) {
+        console.log(label('Wallet') + warn(`${wallets.length} saved, none set as default`));
+      } else {
+        console.log(label('Wallet') + warn('Not configured'));
+      }
+    } catch {
+      console.log(label('Wallet') + warn('Not configured'));
+    }
+
+    // Summary
+    console.log('');
+    if (allOk) {
+      console.log(chalk.green('  Environment ready.'));
+    } else {
+      console.log(chalk.yellow('  Some checks failed. Review the issues above.'));
+    }
+    console.log('');
+  });
+
 program.parse();
