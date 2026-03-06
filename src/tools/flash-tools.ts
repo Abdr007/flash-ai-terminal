@@ -839,6 +839,48 @@ export const walletStatus: ToolDefinition = {
   },
 };
 
+export const walletDisconnect: ToolDefinition = {
+  name: 'wallet_disconnect',
+  description: 'Disconnect the currently active wallet',
+  parameters: z.object({}),
+  execute: async (_params, context): Promise<ToolResult> => {
+    const wm = context.walletManager;
+    if (!wm || (!wm.isConnected && !wm.hasAddress)) {
+      return { success: true, message: chalk.dim('  No wallet connected.') };
+    }
+
+    // Clear wallet from runtime
+    wm.disconnect();
+    context.walletAddress = 'unknown';
+
+    // Clear default so it won't auto-load next startup
+    const config = walletStore.getDefault();
+    if (config) {
+      walletStore.clearDefault();
+    }
+
+    const wasLive = !context.simulationMode;
+
+    const lines = [
+      '',
+      chalk.green('  Wallet disconnected successfully.'),
+      '',
+    ];
+
+    if (wasLive) {
+      lines.push(chalk.yellow('  Live wallet disconnected.'));
+      lines.push(chalk.yellow('  Switching to simulation mode.'));
+      lines.push('');
+    }
+
+    return {
+      success: true,
+      message: lines.join('\n'),
+      data: { disconnected: true },
+    };
+  },
+};
+
 export const walletAddress: ToolDefinition = {
   name: 'wallet_address',
   description: 'Show connected wallet address',
@@ -990,6 +1032,7 @@ export const allFlashTools: ToolDefinition[] = [
   walletList,
   walletUse,
   walletRemove,
+  walletDisconnect,
   walletStatus,
   walletAddress,
   walletBalance,

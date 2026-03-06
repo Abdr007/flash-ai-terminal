@@ -174,6 +174,9 @@ export class ToolEngine {
           params: { name: intent.name },
         };
 
+      case ActionType.WalletDisconnect:
+        return { toolName: 'wallet_disconnect', params: {} };
+
       case ActionType.WalletStatus:
         return { toolName: 'wallet_status', params: {} };
 
@@ -306,6 +309,7 @@ export class ToolEngine {
       `    ${chalk.cyan('wallet list')}                    List stored wallets`,
       `    ${chalk.cyan('wallet use <name>')}              Switch to a stored wallet`,
       `    ${chalk.cyan('wallet remove <name>')}           Remove a stored wallet`,
+      `    ${chalk.cyan('wallet disconnect')}              Disconnect active wallet`,
       `    ${chalk.cyan('wallet connect <path>')}          Connect wallet (one-time)`,
       `    ${chalk.cyan('wallet address')}                 Show wallet address`,
       `    ${chalk.cyan('wallet balance')}                 Show SOL balance`,

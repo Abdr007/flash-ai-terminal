@@ -123,6 +123,13 @@ export class WalletStore {
     saveLocalConfig(config);
   }
 
+  /** Clear the default wallet so none auto-loads on startup. */
+  clearDefault(): void {
+    const config = loadLocalConfig();
+    delete config.defaultWallet;
+    saveLocalConfig(config);
+  }
+
   /** Get the default wallet name. */
   getDefault(): string | null {
     const config = loadLocalConfig();

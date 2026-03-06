@@ -55,6 +55,7 @@ const FAST_DISPATCH: Record<string, ParsedIntent> = {
   'wallet status':   { action: ActionType.WalletStatus },
   'wallet address':  { action: ActionType.WalletAddress },
   'wallet balance':  { action: ActionType.WalletBalance },
+  'wallet disconnect': { action: ActionType.WalletDisconnect },
 };
 
 /** Phase 3: Timeout wrapper for command execution */
@@ -222,11 +223,12 @@ export class FlashTerminal {
       console.log(`  Network: ${chalk.bold(this.config.network)}`);
       console.log(`  Pool:    ${chalk.bold(this.config.defaultPool)}`);
 
-      this.walletManager.getBalance().then(bal => {
+      try {
+        const bal = await this.walletManager.getBalance();
         console.log(`  Balance: ${chalk.green(bal.toFixed(4))} SOL`);
-      }).catch(() => {
+      } catch {
         // silently ignore balance fetch errors at startup
-      });
+      }
     }
 
     console.log(chalk.dim('\n  Type "help" for commands, "exit" to quit.\n'));
@@ -521,6 +523,35 @@ export class FlashTerminal {
     return true;
   }
 
+  /** Handle wallet disconnect: stop autopilot, switch to sim, swap client, update prompt. */
+  private handleDisconnect(): void {
+    // Stop autopilot if running
+    try {
+      const autopilot = getAutopilot(this.context);
+      if (autopilot.state.active) {
+        autopilot.stop();
+        console.log(chalk.yellow('  Autopilot stopped due to wallet disconnect.'));
+      }
+    } catch {
+      // No autopilot instance — fine
+    }
+
+    // Switch to simulation mode
+    if (!this.config.simulationMode) {
+      this.config.simulationMode = true;
+      this.context.simulationMode = true;
+    }
+
+    // Swap to simulation client
+    this.flashClient = new SimulatedFlashClient(10_000);
+    this.context.flashClient = this.flashClient;
+
+    // Rebuild tool engine with updated context
+    this.engine = new ToolEngine(this.context);
+
+    this.updatePrompt();
+  }
+
   /** Phase 2: Update prompt prefix based on current mode */
   private updatePrompt(): void {
     const prefix = this.config.simulationMode
@@ -640,6 +671,11 @@ export class FlashTerminal {
 
     // Display result
     console.log(result.message);
+
+    // Handle wallet disconnect: stop autopilot, switch to simulation, update prompt
+    if (result.data?.disconnected) {
+      this.handleDisconnect();
+    }
 
     // Handle confirmation flow
     if (result.requiresConfirmation && result.data?.executeAction) {

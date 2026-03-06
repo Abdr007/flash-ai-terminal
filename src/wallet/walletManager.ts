@@ -41,6 +41,13 @@ export class WalletManager {
     return this.keypair;
   }
 
+  /** Disconnect wallet: clear keypair and public key from memory. */
+  disconnect(): void {
+    this.keypair = null;
+    this.publicKey = null;
+    this.tokenBalancesCache = null;
+  }
+
   /**
    * Load a keypair from a JSON file (Solana CLI format).
    * Throws on invalid file or keypair.

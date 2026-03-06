@@ -26,6 +26,7 @@ export enum ActionType {
   WalletList = 'wallet_list',
   WalletUse = 'wallet_use',
   WalletRemove = 'wallet_remove',
+  WalletDisconnect = 'wallet_disconnect',
   WalletStatus = 'wallet_status',
   WalletAddress = 'wallet_address',
   WalletBalance = 'wallet_balance',
@@ -153,6 +154,10 @@ export const WalletRemoveSchema = z.object({
   name: z.string(),
 });
 
+export const WalletDisconnectSchema = z.object({
+  action: z.literal(ActionType.WalletDisconnect),
+});
+
 export const WalletStatusSchema = z.object({
   action: z.literal(ActionType.WalletStatus),
 });
@@ -246,6 +251,7 @@ export const ParsedIntentSchema = z.discriminatedUnion('action', [
   WalletListSchema,
   WalletUseSchema,
   WalletRemoveSchema,
+  WalletDisconnectSchema,
   WalletStatusSchema,
   WalletAddressSchema,
   WalletBalanceSchema,

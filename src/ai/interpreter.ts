@@ -26,6 +26,7 @@ Available actions:
 - wallet_list: List stored wallets
 - wallet_use: Switch to a stored wallet (needs name)
 - wallet_remove: Remove a stored wallet (needs name)
+- wallet_disconnect: Disconnect the currently active wallet
 - wallet_status: Show wallet connection status
 - wallet_address: Show connected wallet address
 - wallet_balance: Show wallet SOL balance
@@ -62,6 +63,7 @@ Examples:
 - "wallet list" -> {"action":"wallet_list"}
 - "wallet use main" -> {"action":"wallet_use","name":"main"}
 - "wallet remove old" -> {"action":"wallet_remove","name":"old"}
+- "wallet disconnect" -> {"action":"wallet_disconnect"}
 - "wallet" -> {"action":"wallet_status"}
 - "wallet address" -> {"action":"wallet_address"}
 - "wallet balance" -> {"action":"wallet_balance"}
@@ -125,6 +127,9 @@ export function localParse(input: string): ParsedIntent | null {
   const walletRemoveMatch = lower.match(/^wallet\s+remove\s+(\S+)$/);
   if (walletRemoveMatch) {
     return { action: ActionType.WalletRemove, name: walletRemoveMatch[1] };
+  }
+  if (/^wallet\s+disconnect$/.test(lower)) {
+    return { action: ActionType.WalletDisconnect };
   }
   const walletConnectMatch = lower.match(/^wallet\s+connect\s+(.+)$/);
   if (walletConnectMatch) {
