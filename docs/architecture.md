@@ -153,12 +153,14 @@ User confirms → executeAction()
 FlashClient.openPosition() (or SimulatedFlashClient)
   │
   ├── acquireTradeLock("SOL:long")
-  ├── Pre-trade checks (balance, leverage limits)
-  ├── Fetch blockhash
-  ├── Build transaction via Flash SDK
-  ├── simulateTransaction()
-  ├── sendRawTransaction()
-  ├── Confirm with WebSocket + polling
+  ├── Pre-trade checks (SOL balance, USDC balance, leverage limits)
+  ├── Duplicate position check (getUserPositions)
+  ├── Fetch fresh blockhash
+  ├── Build instructions via Flash SDK
+  ├── MessageV0.compile + sign
+  ├── sendRawTransaction (maxRetries: 3)
+  ├── Poll getSignatureStatuses every 2s (45s timeout)
+  ├── Periodic resend during polling
   ├── releaseTradeLock()
   │
   ▼
