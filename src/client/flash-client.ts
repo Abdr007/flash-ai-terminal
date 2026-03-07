@@ -5,8 +5,8 @@ import {
   TransactionInstruction,
   Signer,
   ComputeBudgetProgram,
-  AddressLookupTableAccount,
   VersionedTransaction,
+  MessageV0,
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
@@ -184,7 +184,6 @@ export class FlashClient implements IFlashClient {
   private priceService: PythPriceService;
   private config: FlashConfig;
   private walletMgr: WalletManager;
-  private altCache: AddressLookupTableAccount[] | null = null;
   private cachedSolBalance = 0;
 
   /** Per-market mutex to prevent concurrent transactions on the same market/side */
@@ -281,14 +280,6 @@ export class FlashClient implements IFlashClient {
     return this.priceService.getPrices(tokens);
   }
 
-  private async getALTs(poolConfig: PoolConfig): Promise<AddressLookupTableAccount[]> {
-    if (this.altCache && poolConfig === this.poolConfig) return this.altCache;
-    const result = await this.perpClient.getOrLoadAddressLookupTable(poolConfig);
-    const tables = result.addressLookupTables;
-    if (poolConfig === this.poolConfig) this.altCache = tables;
-    return tables;
-  }
-
   private findToken(poolConfig: PoolConfig, symbol: string) {
     const tokens = poolConfig.tokens as Array<{ symbol: string; mintKey: PublicKey; decimals: number; pythTicker: string }>;
     const token = tokens.find((t) => t.symbol === symbol);
@@ -355,14 +346,12 @@ export class FlashClient implements IFlashClient {
   private async sendTx(
     instructions: TransactionInstruction[],
     additionalSigners: Signer[],
-    poolConfig: PoolConfig
+    _poolConfig: PoolConfig
   ): Promise<string> {
     const logger = getLogger();
     const maxAttempts = 2;
-    const confirmTimeoutMs = 45_000; // 45s per attempt — 2 attempts covers ~90s blockhash window
     const cuLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.computeUnitLimit });
     const cuPriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.computeUnitPrice });
-    const alts = await this.getALTs(poolConfig);
 
     let lastError = '';
     let lastSignature = '';
@@ -375,130 +364,58 @@ export class FlashClient implements IFlashClient {
         logger.info('CLIENT', `Retry attempt ${attempt}/${maxAttempts}`);
       }
 
-      // Fresh blockhash for each attempt
-      const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
-      logger.debug('CLIENT', `Blockhash: ${latestBlockhash.blockhash} (attempt ${attempt})`);
-
-      // SDK builds, signs, and sends with fresh blockhash
-      // Only pass our CU instructions — SDK's prioritizationFee is set to match in constructor
-      let signatureStr: string;
-      let txBytes: Buffer;
       try {
-        const { signature, versionedTransaction: vtx } = await this.perpClient.sendTransactionV3(
-          [cuLimitIx, cuPriceIx, ...instructions],
-          { alts, additionalSigners, latestBlockhash },
-        );
-        signatureStr = signature;
-        txBytes = Buffer.from(vtx.serialize());
+        const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+        const allIxs = [cuLimitIx, cuPriceIx, ...instructions];
+        const message = MessageV0.compile({
+          payerKey: this.wallet.publicKey,
+          instructions: allIxs,
+          recentBlockhash: latestBlockhash.blockhash,
+          addressLookupTableAccounts: [],
+        });
+        const vtx = new VersionedTransaction(message);
+        vtx.sign([this.wallet, ...additionalSigners]);
+        const txBytes = Buffer.from(vtx.serialize());
+
+        const signatureStr = await this.connection.sendRawTransaction(txBytes, {
+          skipPreflight: true,
+          maxRetries: 3,
+        });
         lastSignature = signatureStr;
         logger.info('CLIENT', `Tx sent: ${signatureStr} (${txBytes.length} bytes, attempt ${attempt})`);
-      } catch (e: unknown) {
-        lastError = getErrorMessage(e);
-        logger.warn('CLIENT', `Send failed (attempt ${attempt}): ${scrubSensitive(lastError)}`);
-        continue;
-      }
 
-      // Simulate with sigVerify:false — catches program errors instantly
-      try {
-        const localVtx = VersionedTransaction.deserialize(txBytes);
-        const sim = await this.connection.simulateTransaction(localVtx, {
-          sigVerify: false,
-          commitment: 'confirmed',
-        });
-        if (sim.value.err) {
-          const errStr = JSON.stringify(sim.value.err);
-
-          // AlreadyProcessed means tx already landed — success
-          if (errStr.includes('AlreadyProcessed')) {
+        // Poll for confirmation with periodic resends
+        process.stdout.write('  Awaiting confirmation... \r');
+        const start = Date.now();
+        const timeoutMs = 45_000;
+        for (let i = 0; Date.now() - start < timeoutMs; i++) {
+          await new Promise(r => setTimeout(r, 2_000));
+          const { value } = await this.connection.getSignatureStatuses([signatureStr]);
+          const status = value?.[0];
+          if (status?.err) {
+            throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.err)}`);
+          }
+          if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
             process.stdout.write('                              \r');
-            logger.info('CLIENT', `Tx already processed: ${signatureStr}`);
+            logger.info('CLIENT', `Tx confirmed: ${signatureStr}`);
             return signatureStr;
           }
-
-          // Before throwing program error, verify the tx hasn't actually landed.
-          // Simulation can return stale errors if state changed between send and simulate.
-          if (await this.isSignatureConfirmed(signatureStr)) {
-            process.stdout.write('                              \r');
-            logger.info('CLIENT', `Tx confirmed despite simulation error: ${signatureStr}`);
-            return signatureStr;
+          // Resend every other poll to improve delivery
+          if (i % 2 === 0) {
+            this.connection.sendRawTransaction(txBytes, { skipPreflight: true, maxRetries: 0 }).catch(() => {});
           }
-
-          // Program error — don't retry, it will fail again
-          process.stdout.write('                              \r');
-          const programLogs = sim.value.logs?.filter(l =>
-            l.includes('Error') || l.includes('failed') || l.includes('ProgramError')
-          ) ?? [];
-          const logSummary = programLogs.length > 0
-            ? programLogs.join('\n    ')
-            : (sim.value.logs?.slice(-3).join('\n    ') ?? 'No logs');
-          throw new Error(
-            `Flash Trade program rejected transaction:\n    ${logSummary}`
-          );
         }
-        logger.debug('CLIENT', `Simulation OK, CU used: ${sim.value.unitsConsumed}`);
+
+        lastError = `Not confirmed within ${timeoutMs / 1000}s`;
+        logger.warn('CLIENT', `Attempt ${attempt} timed out — ${lastError}`);
       } catch (e: unknown) {
         const eMsg = getErrorMessage(e);
-        // Re-throw definitive program errors
-        if (eMsg.includes('rejected')) throw e;
-        // BlockhashNotFound means the tx was already processed or blockhash expired —
-        // don't trust this simulation result, fall through to confirmation
-        if (eMsg.includes('BlockhashNotFound')) {
-          logger.debug('CLIENT', 'Simulation returned BlockhashNotFound — tx may have landed, proceeding to confirm');
-        } else {
-          logger.debug('CLIENT', `Simulation check: ${scrubSensitive(eMsg)}`);
+        if (eMsg.includes('failed on-chain')) {
+          process.stdout.write('                              \r');
+          throw e;
         }
-      }
-
-      // Confirm using blockhash strategy with concurrent re-sends
-      process.stdout.write('  Awaiting confirmation... \r');
-      const confirmed = await this.pollConfirmation(
-        signatureStr, txBytes, confirmTimeoutMs, logger,
-        latestBlockhash.blockhash, latestBlockhash.lastValidBlockHeight,
-      );
-      if (confirmed) {
-        process.stdout.write('                              \r');
-        logger.info('CLIENT', `Tx confirmed: ${signatureStr}`);
-        return signatureStr;
-      }
-
-      // Before retrying, check if the tx actually landed (confirmation timeout != failure)
-      if (await this.isSignatureConfirmed(signatureStr)) {
-        process.stdout.write('                              \r');
-        logger.info('CLIENT', `Tx confirmed on late check: ${signatureStr}`);
-        return signatureStr;
-      }
-
-      lastError = `Not confirmed within ${confirmTimeoutMs / 1000}s`;
-      logger.warn('CLIENT', `Attempt ${attempt} timed out — ${lastError}`);
-
-      // On last failed attempt, re-simulate to get a better error message
-      if (attempt === maxAttempts) {
-        try {
-          const localVtx = VersionedTransaction.deserialize(txBytes);
-          const sim = await this.connection.simulateTransaction(localVtx, {
-            sigVerify: false,
-            commitment: 'confirmed',
-          });
-          if (sim.value.err) {
-            const errStr = JSON.stringify(sim.value.err);
-            if (errStr.includes('AlreadyProcessed') || errStr.includes('BlockhashNotFound')) {
-              // Tx may have landed — do a final signature check
-              if (await this.isSignatureConfirmed(signatureStr)) {
-                process.stdout.write('                              \r');
-                return signatureStr;
-              }
-            } else {
-              const logs = sim.value.logs?.filter(l =>
-                l.includes('Error') || l.includes('failed') || l.includes('ProgramError')
-              ) ?? [];
-              lastError = logs.length > 0
-                ? `Program error: ${logs.join(' | ')}`
-                : `Simulation error: ${errStr}`;
-            }
-          }
-        } catch {
-          // Best effort — simulation may fail with expired blockhash, which is expected
-        }
+        lastError = eMsg;
+        logger.warn('CLIENT', `Attempt ${attempt} failed: ${scrubSensitive(eMsg)}`);
       }
     }
 
@@ -510,62 +427,6 @@ export class FlashClient implements IFlashClient {
     );
   }
 
-  /** Confirm transaction using blockhash strategy + concurrent re-sends. */
-  private async pollConfirmation(
-    signature: string,
-    txBytes: Buffer,
-    _timeoutMs: number,
-    logger: ReturnType<typeof getLogger>,
-    blockhash?: string,
-    lastValidBlockHeight?: number,
-  ): Promise<boolean> {
-    // If we have blockhash info, use Solana's built-in confirmTransaction
-    if (blockhash && lastValidBlockHeight) {
-      const resendInterval = setInterval(() => {
-        this.connection.sendRawTransaction(txBytes, { skipPreflight: true, maxRetries: 0 }).catch(() => {});
-      }, 2_000);
-
-      try {
-        const result = await this.connection.confirmTransaction(
-          { signature, blockhash, lastValidBlockHeight },
-          'confirmed',
-        );
-        if (result.value.err) {
-          throw new Error(`Transaction failed on-chain: ${JSON.stringify(result.value.err)}`);
-        }
-        return true;
-      } catch (e: unknown) {
-        const msg = getErrorMessage(e);
-        if (msg.includes('failed on-chain')) throw e;
-        if (msg.includes('expired') || msg.includes('block height')) {
-          logger.debug('CLIENT', 'Blockhash expired during confirmation');
-          return false;
-        }
-        logger.debug('CLIENT', `Confirmation error: ${scrubSensitive(msg)}`);
-        return false;
-      } finally {
-        clearInterval(resendInterval);
-      }
-    }
-
-    // Fallback: manual polling (if no blockhash info available)
-    const start = Date.now();
-    for (let i = 0; Date.now() - start < _timeoutMs; i++) {
-      await new Promise(r => setTimeout(r, 1_000));
-      try {
-        const { value } = await this.connection.getSignatureStatuses([signature]);
-        const status = value?.[0];
-        if (status?.err) throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.err)}`);
-        if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return true;
-      } catch (e: unknown) {
-        if (getErrorMessage(e).includes('failed on-chain')) throw e;
-      }
-      if (i % 2 === 0) {
-        this.connection.sendRawTransaction(txBytes, { skipPreflight: true, maxRetries: 0 }).catch(() => {});
-      }
-    }
-    return false;
-  }
 
   // ─── Trade Mutex ──────────────────────────────────────────────────────────
 

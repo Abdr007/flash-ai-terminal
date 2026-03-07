@@ -112,12 +112,12 @@ export class WalletManager {
     }
 
     const keyBytes = Uint8Array.from(secretKey);
-    // Zero the parsed array immediately — Keypair holds its own copy
+    // Zero the parsed array immediately
     secretKey.fill(0);
 
+    // Keypair.fromSecretKey does NOT copy the input — it holds a reference.
+    // Do NOT zero keyBytes after this call, or the keypair's secret key is corrupted.
     this.keypair = Keypair.fromSecretKey(keyBytes);
-    // Zero the intermediate Uint8Array — Keypair has made its own internal copy
-    keyBytes.fill(0);
 
     this.publicKey = this.keypair.publicKey;
 
