@@ -32,6 +32,7 @@ import {
   OpenPositionResult,
   ClosePositionResult,
   CollateralResult,
+  DryRunPreview,
   getLeverageLimits,
 } from '../types/index.js';
 import { PythHttpClient, getPythProgramKeyForCluster, PriceData } from '@pythnetwork/client';
@@ -135,10 +136,17 @@ class PythPriceService {
         timestamp: new BN(priceData.timestamp.toString()),
       });
 
+      const uiPrice = priceData.aggregate.price ?? 0;
+      // Reject zero or negative prices from oracle — prevents trades at invalid prices
+      if (!Number.isFinite(uiPrice) || uiPrice <= 0) {
+        logger.warn('PRICE', `Invalid oracle price for ${token.symbol}: ${uiPrice} — skipping`);
+        continue;
+      }
+
       const tokenPrice: LiveTokenPrice = {
         price,
         emaPrice,
-        uiPrice: priceData.aggregate.price ?? 0,
+        uiPrice,
         timestamp: priceData.timestamp ? Number(priceData.timestamp) * 1000 : now,
       };
 
@@ -608,39 +616,44 @@ export class FlashClient implements IFlashClient {
 
     await this.ensureSufficientSol();
 
-    const poolConfig = this.getPoolConfigForMarket(market);
-    const sdkSide = toSdkSide(side);
+    this.acquireTradeLock(market, side);
+    try {
+      const poolConfig = this.getPoolConfigForMarket(market);
+      const sdkSide = toSdkSide(side);
 
-    const targetToken = this.findToken(poolConfig, market);
-    const receivingToken = receiveToken
-      ? this.findToken(poolConfig, receiveToken)
-      : this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
+      const targetToken = this.findToken(poolConfig, market);
+      const receivingToken = receiveToken
+        ? this.findToken(poolConfig, receiveToken)
+        : this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
 
-    const priceMap = await this.getPriceMap(poolConfig);
-    const targetPrice = priceMap.get(targetToken.symbol);
-    if (!targetPrice) throw new Error(`Oracle unavailable for ${targetToken.symbol}. Try again later.`);
+      const priceMap = await this.getPriceMap(poolConfig);
+      const targetPrice = priceMap.get(targetToken.symbol);
+      if (!targetPrice) throw new Error(`Oracle unavailable for ${targetToken.symbol}. Try again later.`);
 
-    const priceAfterSlippage = this.perpClient.getPriceAfterSlippage(
-      false, new BN(this.config.defaultSlippageBps), targetPrice.price, sdkSide
-    );
-
-    let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
-    if (receivingToken.symbol === targetToken.symbol) {
-      result = await this.perpClient.closePosition(
-        targetToken.symbol, receivingToken.symbol, priceAfterSlippage,
-        sdkSide, poolConfig, Privilege.None
+      const priceAfterSlippage = this.perpClient.getPriceAfterSlippage(
+        false, new BN(this.config.defaultSlippageBps), targetPrice.price, sdkSide
       );
-    } else {
-      result = await this.perpClient.closeAndSwap(
-        targetToken.symbol, receivingToken.symbol, targetToken.symbol,
-        priceAfterSlippage, sdkSide, poolConfig, Privilege.None
-      );
+
+      let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
+      if (receivingToken.symbol === targetToken.symbol) {
+        result = await this.perpClient.closePosition(
+          targetToken.symbol, receivingToken.symbol, priceAfterSlippage,
+          sdkSide, poolConfig, Privilege.None
+        );
+      } else {
+        result = await this.perpClient.closeAndSwap(
+          targetToken.symbol, receivingToken.symbol, targetToken.symbol,
+          priceAfterSlippage, sdkSide, poolConfig, Privilege.None
+        );
+      }
+
+      const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
+
+      logger.trade('CLOSE', { market, side, price: targetPrice.uiPrice, tx: txSignature });
+      return { txSignature, exitPrice: targetPrice.uiPrice, pnl: 0 };
+    } finally {
+      this.releaseTradeLock(market, side);
     }
-
-    const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
-
-    logger.trade('CLOSE', { market, side, price: targetPrice.uiPrice, tx: txSignature });
-    return { txSignature, exitPrice: targetPrice.uiPrice, pnl: 0 };
   }
 
   // ─── Collateral Management ────────────────────────────────────────────────
@@ -648,35 +661,195 @@ export class FlashClient implements IFlashClient {
   async addCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult> {
     await this.ensureSufficientSol();
 
-    const poolConfig = this.getPoolConfigForMarket(market);
-    const token = this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
-    const amountNative = uiDecimalsToNative(amount.toString(), token.decimals);
-    const { position } = await this.findUserPosition(poolConfig, market, side);
+    this.acquireTradeLock(market, side);
+    try {
+      const poolConfig = this.getPoolConfigForMarket(market);
+      const token = this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
+      const amountNative = uiDecimalsToNative(amount.toString(), token.decimals);
+      const { position } = await this.findUserPosition(poolConfig, market, side);
 
-    const result = await this.perpClient.addCollateral(
-      amountNative, market, token.symbol, toSdkSide(side), position.pubkey, poolConfig
-    );
+      const result = await this.perpClient.addCollateral(
+        amountNative, market, token.symbol, toSdkSide(side), position.pubkey, poolConfig
+      );
 
-    const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
-    getLogger().trade('ADD_COLLATERAL', { market, side, amount, tx: txSignature });
-    return { txSignature };
+      const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
+      getLogger().trade('ADD_COLLATERAL', { market, side, amount, tx: txSignature });
+      return { txSignature };
+    } finally {
+      this.releaseTradeLock(market, side);
+    }
   }
 
   async removeCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult> {
     await this.ensureSufficientSol();
 
-    const poolConfig = this.getPoolConfigForMarket(market);
-    const token = this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
-    const amountNative = uiDecimalsToNative(amount.toString(), token.decimals);
-    const { position } = await this.findUserPosition(poolConfig, market, side);
+    this.acquireTradeLock(market, side);
+    try {
+      const poolConfig = this.getPoolConfigForMarket(market);
+      const token = this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
+      const amountNative = uiDecimalsToNative(amount.toString(), token.decimals);
+      const { position } = await this.findUserPosition(poolConfig, market, side);
 
-    const result = await this.perpClient.removeCollateral(
-      amountNative, market, token.symbol, toSdkSide(side), position.pubkey, poolConfig
+      const result = await this.perpClient.removeCollateral(
+        amountNative, market, token.symbol, toSdkSide(side), position.pubkey, poolConfig
+      );
+
+      const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
+      getLogger().trade('REMOVE_COLLATERAL', { market, side, amount, tx: txSignature });
+      return { txSignature };
+    } finally {
+      this.releaseTradeLock(market, side);
+    }
+  }
+
+  // ─── Dry Run / Transaction Preview ─────────────────────────────────────
+
+  /**
+   * Build a transaction preview without signing or sending.
+   * Compiles the transaction, runs Solana simulation, and returns details.
+   * SAFETY: No signing or sending occurs. The transaction is compiled and simulated only.
+   */
+  async previewOpenPosition(
+    market: string,
+    side: TradeSide,
+    collateralAmount: number,
+    leverage: number,
+    collateralToken?: string,
+  ): Promise<DryRunPreview> {
+    const logger = getLogger();
+
+    this.validateLeverage(market, leverage);
+    if (collateralAmount < 10) {
+      throw new Error(`Minimum collateral is $10 (got $${collateralAmount}).`);
+    }
+
+    const poolConfig = this.getPoolConfigForMarket(market);
+    const sdkSide = toSdkSide(side);
+    const targetToken = this.findToken(poolConfig, market);
+    const collateralSymbol = collateralToken ?? DEFAULT_COLLATERAL_TOKEN;
+    const inputToken = this.findToken(poolConfig, collateralSymbol);
+
+    const priceMap = await this.getPriceMap(poolConfig);
+    const targetPrice = priceMap.get(targetToken.symbol);
+    const inputPrice = priceMap.get(inputToken.symbol);
+    if (!targetPrice) throw new Error(`Oracle unavailable for ${targetToken.symbol}.`);
+    if (!inputPrice) throw new Error(`Oracle unavailable for ${inputToken.symbol}.`);
+
+    const priceAfterSlippage = this.perpClient.getPriceAfterSlippage(
+      true, new BN(this.config.defaultSlippageBps), targetPrice.price, sdkSide,
     );
 
-    const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
-    getLogger().trade('REMOVE_COLLATERAL', { market, side, amount, tx: txSignature });
-    return { txSignature };
+    const collateralNative = uiDecimalsToNative(collateralAmount.toString(), inputToken.decimals);
+    const inputCustody = this.findCustody(poolConfig, inputToken.symbol);
+    const outputCustody = this.findCustody(poolConfig, targetToken.symbol);
+
+    const custodyAccounts = await withRetry(
+      () => this.perpClient.program.account.custody.fetchMultiple([
+        inputCustody.custodyAccount, outputCustody.custodyAccount,
+      ]),
+      'custody-fetch-preview',
+      { maxAttempts: 2 },
+    );
+
+    if (!custodyAccounts[0] || !custodyAccounts[1]) {
+      throw new Error('Failed to fetch custody accounts from chain');
+    }
+
+    const sizeAmount = this.perpClient.getSizeAmountFromLeverageAndCollateral(
+      collateralNative, leverage.toString(), targetToken as unknown as Token, inputToken as unknown as Token, sdkSide,
+      targetPrice.price, targetPrice.emaPrice,
+      CustodyAccount.from(outputCustody.custodyAccount, custodyAccounts[1]),
+      inputPrice.price, inputPrice.emaPrice,
+      CustodyAccount.from(inputCustody.custodyAccount, custodyAccounts[0]),
+      BN_ZERO,
+    );
+
+    let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
+    if (inputToken.symbol === targetToken.symbol) {
+      result = await this.perpClient.openPosition(
+        targetToken.symbol, inputToken.symbol, priceAfterSlippage,
+        collateralNative, sizeAmount, sdkSide, poolConfig, Privilege.None,
+      );
+    } else {
+      result = await this.perpClient.swapAndOpen(
+        targetToken.symbol, targetToken.symbol, inputToken.symbol,
+        collateralNative, priceAfterSlippage, sizeAmount, sdkSide,
+        poolConfig, Privilege.None,
+      );
+    }
+
+    // Build the transaction WITHOUT signing
+    const cuLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.computeUnitLimit });
+    const cuPriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.computeUnitPrice });
+    const allIxs = [cuLimitIx, cuPriceIx, ...result.instructions];
+
+    const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+    const message = MessageV0.compile({
+      payerKey: this.wallet.publicKey,
+      instructions: allIxs,
+      recentBlockhash: latestBlockhash.blockhash,
+      addressLookupTableAccounts: [],
+    });
+    const vtx = new VersionedTransaction(message);
+    // DO NOT sign — this is a preview only
+    const txBytes = Buffer.from(vtx.serialize());
+
+    // Collect unique accounts from all instructions
+    const accountSet = new Set<string>();
+    for (const ix of allIxs) {
+      accountSet.add(ix.programId.toBase58());
+      for (const key of ix.keys) {
+        accountSet.add(key.pubkey.toBase58());
+      }
+    }
+
+    // Liquidation price estimate
+    const liqDist = leverage > 0 ? (1 / leverage) * 0.9 : 0;
+    const liqPrice = side === TradeSide.Long
+      ? targetPrice.uiPrice * (1 - liqDist)
+      : targetPrice.uiPrice * (1 + liqDist);
+
+    const preview: DryRunPreview = {
+      market,
+      side,
+      collateral: collateralAmount,
+      leverage,
+      positionSize: collateralAmount * leverage,
+      entryPrice: targetPrice.uiPrice,
+      liquidationPrice: liqPrice,
+      estimatedFee: (collateralAmount * leverage * 8) / 10_000, // 0.08% fee
+      programId: poolConfig.programId.toBase58(),
+      accountCount: accountSet.size,
+      instructionCount: allIxs.length,
+      estimatedComputeUnits: this.config.computeUnitLimit,
+      transactionSize: txBytes.length,
+    };
+
+    // Run Solana simulation (RPC simulateTransaction)
+    try {
+      // Sign for simulation only (required by simulateTransaction)
+      const simVtx = new VersionedTransaction(message);
+      simVtx.sign([this.wallet, ...result.additionalSigners]);
+
+      const simResult = await this.connection.simulateTransaction(simVtx, {
+        sigVerify: false,
+        replaceRecentBlockhash: true,
+      });
+
+      preview.simulationSuccess = !simResult.value.err;
+      preview.simulationLogs = simResult.value.logs ?? [];
+      preview.simulationUnitsConsumed = simResult.value.unitsConsumed ?? 0;
+      if (simResult.value.err) {
+        preview.simulationError = JSON.stringify(simResult.value.err);
+      }
+    } catch (e: unknown) {
+      preview.simulationSuccess = false;
+      preview.simulationError = getErrorMessage(e);
+      logger.debug('DRYRUN', `Simulation failed: ${getErrorMessage(e)}`);
+    }
+
+    logger.info('DRYRUN', `Preview built for ${market} ${side} ${leverage}x $${collateralAmount}`);
+    return preview;
   }
 
   // ─── Queries ──────────────────────────────────────────────────────────────

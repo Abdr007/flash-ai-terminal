@@ -11,6 +11,7 @@ import {
   OpenPositionResult,
   ClosePositionResult,
   CollateralResult,
+  DryRunPreview,
   validateTrade,
 } from '../types/index.js';
 import { PriceService } from '../data/prices.js';
@@ -348,6 +349,38 @@ export class SimulatedFlashClient implements IFlashClient {
 
   getBalance(): number {
     return this.state.balance;
+  }
+
+  async previewOpenPosition(
+    market: string,
+    side: TradeSide,
+    collateralAmount: number,
+    leverage: number,
+  ): Promise<DryRunPreview> {
+    await this.refreshPrices();
+
+    const validation = validateTrade(market, side, collateralAmount, leverage, this.state.balance);
+    if (!validation.valid) {
+      throw new Error(validation.errors.join('; '));
+    }
+
+    const price = this.getPrice(market);
+    const sizeUsd = collateralAmount * leverage;
+    const liqPrice = this.calcLiquidationPrice(price, leverage, side);
+    const fee = (sizeUsd * SIM_FEE_BPS) / 10_000;
+
+    return {
+      market: market.toUpperCase(),
+      side,
+      collateral: collateralAmount,
+      leverage,
+      positionSize: sizeUsd,
+      entryPrice: price,
+      liquidationPrice: liqPrice,
+      estimatedFee: fee,
+      simulationSuccess: true,
+      simulationLogs: ['[Simulation mode — no on-chain transaction compiled]'],
+    };
   }
 
   getTradeHistory(): SimulatedTrade[] {

@@ -68,6 +68,9 @@ export enum ActionType {
   RpcStatus = 'rpc_status',
   RpcTest = 'rpc_test',
   TxInspect = 'tx_inspect',
+
+  // Dry Run
+  DryRun = 'dry_run',
 }
 
 // ─── Zod Schemas for Intent Parsing ──────────────────────────────────────────
@@ -287,6 +290,11 @@ export const TxInspectSchema = z.object({
   signature: z.string().optional(),
 });
 
+export const DryRunSchema = z.object({
+  action: z.literal(ActionType.DryRun),
+  innerCommand: z.string(),
+});
+
 export const ParsedIntentSchema = z.discriminatedUnion('action', [
   OpenPositionSchema,
   ClosePositionSchema,
@@ -333,6 +341,7 @@ export const ParsedIntentSchema = z.discriminatedUnion('action', [
   RpcStatusSchema,
   RpcTestSchema,
   TxInspectSchema,
+  DryRunSchema,
 ]);
 
 export type ParsedIntent = z.infer<typeof ParsedIntentSchema>;
@@ -579,6 +588,28 @@ export interface RawActivityRecord {
   [key: string]: unknown;
 }
 
+// ─── Dry Run Preview ──────────────────────────────────────────────────────
+
+export interface DryRunPreview {
+  market: string;
+  side: TradeSide;
+  collateral: number;
+  leverage: number;
+  positionSize: number;
+  entryPrice: number;
+  liquidationPrice: number;
+  estimatedFee: number;
+  programId?: string;
+  accountCount?: number;
+  instructionCount?: number;
+  estimatedComputeUnits?: number;
+  transactionSize?: number;
+  simulationSuccess?: boolean;
+  simulationLogs?: string[];
+  simulationError?: string;
+  simulationUnitsConsumed?: number;
+}
+
 // ─── Client Interfaces ───────────────────────────────────────────────────────
 
 export interface IFlashClient {
@@ -614,6 +645,15 @@ export interface IFlashClient {
   getMarketData(market?: string): Promise<MarketData[]>;
   getPortfolio(): Promise<Portfolio>;
   getBalance(): number;
+
+  /** Build a transaction preview without signing or sending. */
+  previewOpenPosition?(
+    market: string,
+    side: TradeSide,
+    collateralAmount: number,
+    leverage: number,
+    collateralToken?: string,
+  ): Promise<DryRunPreview>;
 }
 
 export interface IDataClient {

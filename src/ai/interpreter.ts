@@ -103,6 +103,71 @@ function parseSide(raw: string): TradeSide | null {
   return null;
 }
 
+// ─── Number Word Normalization ────────────────────────────────────────────
+
+const NUMBER_WORDS: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
+  thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70,
+  eighty: 80, ninety: 90, hundred: 100, thousand: 1000,
+};
+
+/** Convert number words to digits: "ten" → "10", "twenty five" → "25" */
+function normalizeNumberWords(text: string): string {
+  let result = text;
+  // Handle compound forms: "twenty five" → "25"
+  result = result.replace(
+    /\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\s+(one|two|three|four|five|six|seven|eight|nine)\b/gi,
+    (_match, tens: string, ones: string) => {
+      const t = NUMBER_WORDS[tens.toLowerCase()] ?? 0;
+      const o = NUMBER_WORDS[ones.toLowerCase()] ?? 0;
+      return String(t + o);
+    },
+  );
+  // Handle "X hundred" multiplier
+  result = result.replace(
+    /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+hundred\b/gi,
+    (_match, n: string) => {
+      const val = NUMBER_WORDS[n.toLowerCase()] ?? parseInt(n, 10);
+      return Number.isFinite(val) ? String(val * 100) : n;
+    },
+  );
+  // Handle "X thousand" multiplier
+  result = result.replace(
+    /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+thousand\b/gi,
+    (_match, n: string) => {
+      const val = NUMBER_WORDS[n.toLowerCase()] ?? parseInt(n, 10);
+      return Number.isFinite(val) ? String(val * 1000) : n;
+    },
+  );
+  // Handle standalone number words
+  for (const [word, num] of Object.entries(NUMBER_WORDS)) {
+    if (num >= 100) continue; // multipliers handled above
+    result = result.replace(new RegExp(`\\b${word}\\b`, 'gi'), String(num));
+  }
+  return result;
+}
+
+// ─── Asset Alias Dictionary ───────────────────────────────────────────────
+
+const ASSET_ALIASES: Record<string, string> = {
+  solana: 'SOL', bitcoin: 'BTC', ethereum: 'ETH', ether: 'ETH',
+  binance: 'BNB', jupiter: 'JUP', raydium: 'RAY',
+  dogwifhat: 'WIF', bonk: 'BONK', pyth: 'PYTH',
+  gold: 'XAU', silver: 'XAG', crude: 'CRUDEOIL', oil: 'CRUDEOIL',
+};
+
+/** Normalize asset aliases: "solana" → "SOL" */
+function normalizeAssetAliases(text: string): string {
+  let result = text;
+  for (const [alias, symbol] of Object.entries(ASSET_ALIASES)) {
+    result = result.replace(new RegExp(`\\b${alias}\\b`, 'gi'), symbol.toLowerCase());
+  }
+  return result;
+}
+
 /**
  * Fast local regex-based parser for common commands.
  * Exported so it can be used by both AIInterpreter and OfflineInterpreter.
@@ -110,7 +175,9 @@ function parseSide(raw: string): TradeSide | null {
 export function localParse(input: string): ParsedIntent | null {
   // Sanitize: collapse whitespace (tabs, newlines, etc.) to single spaces, strip control chars
   const sanitized = input.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
-  const lower = sanitized.toLowerCase();
+  // Pre-process: normalize number words and asset aliases
+  const normalized = normalizeAssetAliases(normalizeNumberWords(sanitized));
+  const lower = normalized.toLowerCase();
 
   // Help
   if (/^(help|commands|\?)$/.test(lower)) {
@@ -345,6 +412,13 @@ export function localParse(input: string): ParsedIntent | null {
     return { action: ActionType.ScanMarkets };
   }
 
+  // ─── Dry Run Command ────────────────────────────────────────────────────
+
+  const dryrunMatch = lower.match(/^(?:dryrun|dry-run|dry\s+run)\s+(.+)$/);
+  if (dryrunMatch) {
+    return { action: ActionType.DryRun, innerCommand: dryrunMatch[1] };
+  }
+
   // ─── Portfolio Intelligence Commands ──────────────────────────────────────
 
   if (/^(?:portfolio\s+state|portfolio\s+status|capital)$/.test(lower)) {
@@ -362,9 +436,23 @@ export function localParse(input: string): ParsedIntent | null {
   return null;
 }
 
+// ─── Conversation Context for Follow-Up Commands ──────────────────────────
+
+interface CommandContext {
+  lastMarket?: string;
+  lastSide?: TradeSide;
+  lastLeverage?: number;
+  lastCollateral?: number;
+  lastAction?: ActionType;
+  updatedAt: number;
+}
+
+const CONTEXT_TTL_MS = 120_000; // 2 minutes
+
 export class AIInterpreter {
   private anthropic: Anthropic | null;
   private groq: OpenAI | null;
+  private context: CommandContext = { updatedAt: 0 };
 
   constructor(apiKey: string, groqApiKey?: string) {
     this.anthropic = apiKey ? new Anthropic({ apiKey }) : null;
@@ -376,6 +464,66 @@ export class AIInterpreter {
   private static readonly MAX_INPUT_LENGTH = 500;
   private static readonly API_TIMEOUT_MS = 15_000;
 
+  /** Update conversation context after a successful parse. */
+  private updateContext(intent: ParsedIntent): void {
+    const now = Date.now();
+    if ('market' in intent && intent.market) this.context.lastMarket = intent.market as string;
+    if ('side' in intent) this.context.lastSide = intent.side as TradeSide;
+    if ('leverage' in intent) this.context.lastLeverage = intent.leverage as number;
+    if ('collateral' in intent) this.context.lastCollateral = intent.collateral as number;
+    this.context.lastAction = intent.action;
+    this.context.updatedAt = now;
+  }
+
+  /** Get fresh context (returns undefined if expired). */
+  private getContext(): CommandContext | undefined {
+    if (Date.now() - this.context.updatedAt > CONTEXT_TTL_MS) return undefined;
+    return this.context;
+  }
+
+  /**
+   * Try to resolve follow-up commands using conversation context.
+   * e.g., after "analyze SOL", "close it" → close SOL long
+   */
+  private tryContextualParse(userInput: string): ParsedIntent | null {
+    const ctx = this.getContext();
+    if (!ctx) return null;
+
+    const lower = normalizeAssetAliases(normalizeNumberWords(userInput))
+      .replace(/[\x00-\x1f\x7f]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+    // "close it" / "close that" / "close the position"
+    if (/^close\s+(it|that|the\s+position)$/.test(lower) && ctx.lastMarket && ctx.lastSide) {
+      return { action: ActionType.ClosePosition, market: ctx.lastMarket, side: ctx.lastSide };
+    }
+
+    // "increase to $X" / "change collateral to $X"
+    const increaseMatch = lower.match(/^(?:increase|change|set)\s+(?:it\s+)?(?:collateral\s+)?to\s+\$?(\d+(?:\.\d+)?)$/);
+    if (increaseMatch && ctx.lastMarket && ctx.lastSide && ctx.lastCollateral) {
+      const newAmount = parseFloat(increaseMatch[1]);
+      const diff = newAmount - ctx.lastCollateral;
+      if (diff > 0) {
+        return { action: ActionType.AddCollateral, market: ctx.lastMarket, side: ctx.lastSide, amount: diff };
+      }
+    }
+
+    // "add $X to it" / "add $X more"
+    const addMatch = lower.match(/^add\s+\$?(\d+(?:\.\d+)?)\s+(?:to\s+it|more|to\s+that)$/);
+    if (addMatch && ctx.lastMarket && ctx.lastSide) {
+      return { action: ActionType.AddCollateral, market: ctx.lastMarket, side: ctx.lastSide, amount: parseFloat(addMatch[1]) };
+    }
+
+    // "analyze it" / "what about it"
+    if (/^(?:analyze\s+it|what\s+about\s+it)$/.test(lower) && ctx.lastMarket) {
+      return { action: ActionType.Analyze, market: ctx.lastMarket };
+    }
+
+    return null;
+  }
+
   async parseIntent(userInput: string): Promise<ParsedIntent> {
     const logger = getLogger();
 
@@ -383,7 +531,16 @@ export class AIInterpreter {
     const localResult = localParse(userInput);
     if (localResult) {
       logger.debug('AI', 'Parsed locally', { input: userInput, action: localResult.action });
+      this.updateContext(localResult);
       return localResult;
+    }
+
+    // Try contextual follow-up resolution
+    const contextResult = this.tryContextualParse(userInput);
+    if (contextResult) {
+      logger.debug('AI', 'Parsed with context', { input: userInput, action: contextResult.action });
+      this.updateContext(contextResult);
+      return contextResult;
     }
 
     // Input length limit before sending to AI
@@ -395,12 +552,12 @@ export class AIInterpreter {
     // Try primary AI provider first, then Groq as fallback
     if (this.anthropic) {
       const result = await this.tryAnthropic(userInput);
-      if (result) return result;
+      if (result) { this.updateContext(result); return result; }
     }
 
     if (this.groq) {
       const result = await this.tryGroq(userInput);
-      if (result) return result;
+      if (result) { this.updateContext(result); return result; }
     }
 
     logger.warn('AI', 'No AI provider available. Using local parsing only.');

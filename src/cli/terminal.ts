@@ -5,7 +5,7 @@ import { join, resolve } from 'path';
 import chalk from 'chalk';
 import { AIInterpreter, OfflineInterpreter } from '../ai/interpreter.js';
 import { ToolEngine } from '../tools/engine.js';
-import { ToolContext, ToolResult, FlashConfig, IFlashClient, ActionType, ParsedIntent } from '../types/index.js';
+import { ToolContext, ToolResult, FlashConfig, IFlashClient, ActionType, ParsedIntent, DryRunPreview, TradeSide } from '../types/index.js';
 import { SimulatedFlashClient } from '../client/simulation.js';
 import { FStatsClient } from '../data/fstats.js';
 import { WalletManager, createConnection } from '../wallet/index.js';
@@ -1140,6 +1140,10 @@ export class FlashTerminal {
 
     if (fastIntent) {
       intent = fastIntent;
+    } else if (lower.startsWith('dryrun ') || lower.startsWith('dry-run ') || lower.startsWith('dry run ')) {
+      const prefix = lower.startsWith('dryrun ') ? 'dryrun ' : lower.startsWith('dry-run ') ? 'dry-run ' : 'dry run ';
+      const innerCmd = input.slice(prefix.length).trim();
+      intent = { action: ActionType.DryRun, innerCommand: innerCmd } as ParsedIntent;
     } else if (lower.startsWith('inspect pool ')) {
       const pool = input.slice('inspect pool '.length).trim();
       intent = { action: ActionType.InspectPool, pool } as ParsedIntent;
@@ -1163,6 +1167,12 @@ export class FlashTerminal {
         console.log(chalk.red(`  Parse error: ${getErrorMessage(error)}`));
         return;
       }
+    }
+
+    // ─── Dry Run Intercept ──────────────────────────────────────────
+    if (intent.action === ActionType.DryRun && 'innerCommand' in intent) {
+      await this.handleDryRun(intent.innerCommand as string);
+      return;
     }
 
     // Execute tool
@@ -1237,6 +1247,147 @@ export class FlashTerminal {
     if (elapsed > SLOW_COMMAND_MS) {
       console.log(chalk.dim(`  [${(elapsed / 1000).toFixed(1)}s]`));
     }
+  }
+
+  // ─── Dry Run Handler ─────────────────────────────────────────────
+
+  /**
+   * Handle dry-run commands.
+   * Parses the inner command, builds a transaction preview, and displays it.
+   * SAFETY: No transaction is ever signed or sent.
+   */
+  private async handleDryRun(innerCommand: string): Promise<void> {
+    // Parse the inner command using the interpreter
+    process.stdout.write(chalk.dim('  Parsing inner command...\r'));
+    let innerIntent: ParsedIntent;
+    try {
+      innerIntent = await withTimeout(
+        this.interpreter.parseIntent(innerCommand),
+        COMMAND_TIMEOUT_MS,
+        'dryrun-parse',
+      );
+      process.stdout.write('                           \r');
+    } catch (error: unknown) {
+      console.log(chalk.red(`  Failed to parse inner command: ${getErrorMessage(error)}`));
+      return;
+    }
+
+    // Only trade actions are supported for dry-run
+    if (innerIntent.action !== ActionType.OpenPosition) {
+      console.log('');
+      console.log(chalk.yellow('  Dry run currently supports open position commands only.'));
+      console.log('');
+      console.log(chalk.dim('  Usage:'));
+      console.log(chalk.dim('    dryrun open 2x long SOL $10'));
+      console.log(chalk.dim('    dryrun open 5x short BTC $100'));
+      console.log('');
+      return;
+    }
+
+    if (innerIntent.action !== ActionType.OpenPosition) return;
+    const { market, side, collateral, leverage, collateral_token } = innerIntent;
+
+    process.stdout.write(chalk.dim('  Building transaction preview...\r'));
+
+    try {
+      if (!this.flashClient.previewOpenPosition) {
+        console.log(chalk.red('  Dry run not available for this client.'));
+        return;
+      }
+
+      const preview = await withTimeout(
+        this.flashClient.previewOpenPosition(market, side, collateral, leverage, collateral_token),
+        COMMAND_TIMEOUT_MS,
+        'dryrun-preview',
+      );
+      process.stdout.write('                                   \r');
+      this.renderDryRunPreview(preview);
+    } catch (error: unknown) {
+      process.stdout.write('                                   \r');
+      console.log(chalk.red(`  Dry run failed: ${getErrorMessage(error)}`));
+    }
+  }
+
+  /** Render a dry-run transaction preview. */
+  private renderDryRunPreview(preview: DryRunPreview): void {
+    const sideColor = preview.side === TradeSide.Long ? chalk.green : chalk.red;
+    const sideStr = preview.side === TradeSide.Long ? 'LONG' : 'SHORT';
+
+    console.log('');
+    console.log(chalk.bold.cyan('  TRANSACTION PREVIEW (DRY RUN)'));
+    console.log(chalk.dim('  ────────────────────────────────────────'));
+    console.log('');
+
+    // Trade parameters
+    console.log(chalk.bold('  Trade Parameters'));
+    console.log(`    Market:         ${chalk.bold(preview.market)}`);
+    console.log(`    Side:           ${sideColor(sideStr)}`);
+    console.log(`    Collateral:     ${chalk.bold('$' + preview.collateral.toFixed(2))}`);
+    console.log(`    Leverage:       ${chalk.bold(preview.leverage + 'x')}`);
+    console.log(`    Position Size:  ${chalk.bold('$' + preview.positionSize.toFixed(2))}`);
+    console.log('');
+    console.log(`    Entry Price:    $${preview.entryPrice.toFixed(preview.entryPrice < 1 ? 6 : 2)}`);
+    console.log(`    Liq. Price:     ${chalk.red('$' + preview.liquidationPrice.toFixed(preview.liquidationPrice < 1 ? 6 : 2))}`);
+    console.log(`    Est. Fee:       $${preview.estimatedFee.toFixed(4)}`);
+
+    // Solana transaction info (live mode only)
+    if (preview.programId) {
+      console.log('');
+      console.log(chalk.dim('  ────────────────────────────────────────'));
+      console.log(chalk.bold('  Solana Transaction'));
+      console.log(`    Program:        ${chalk.dim(preview.programId)}`);
+      console.log(`    Accounts:       ${preview.accountCount}`);
+      console.log(`    Instructions:   ${preview.instructionCount}`);
+      console.log(`    Tx Size:        ${preview.transactionSize} bytes`);
+      console.log(`    CU Budget:      ${preview.estimatedComputeUnits?.toLocaleString()}`);
+    }
+
+    // Simulation results
+    if (preview.simulationSuccess !== undefined) {
+      console.log('');
+      console.log(chalk.dim('  ────────────────────────────────────────'));
+      console.log(chalk.bold('  Simulation Result'));
+
+      if (preview.simulationSuccess) {
+        console.log(`    Status:         ${chalk.green('SUCCESS')}`);
+        if (preview.simulationUnitsConsumed) {
+          console.log(`    CU Consumed:    ${preview.simulationUnitsConsumed.toLocaleString()}`);
+        }
+      } else {
+        console.log(`    Status:         ${chalk.red('FAILED')}`);
+        if (preview.simulationError) {
+          console.log(`    Error:          ${chalk.red(preview.simulationError)}`);
+        }
+      }
+
+      // Show program logs (truncated)
+      if (preview.simulationLogs && preview.simulationLogs.length > 0) {
+        console.log('');
+        console.log(chalk.bold('  Program Logs'));
+        const maxLogs = 15;
+        const logs = preview.simulationLogs.slice(0, maxLogs);
+        for (const log of logs) {
+          // Highlight program invocations and errors
+          if (log.includes('invoke')) {
+            console.log(`    ${chalk.cyan(log)}`);
+          } else if (log.includes('error') || log.includes('Error') || log.includes('failed')) {
+            console.log(`    ${chalk.red(log)}`);
+          } else if (log.includes('success')) {
+            console.log(`    ${chalk.green(log)}`);
+          } else {
+            console.log(`    ${chalk.dim(log)}`);
+          }
+        }
+        if (preview.simulationLogs.length > maxLogs) {
+          console.log(chalk.dim(`    ... ${preview.simulationLogs.length - maxLogs} more log lines`));
+        }
+      }
+    }
+
+    console.log('');
+    console.log(chalk.dim('  ────────────────────────────────────────'));
+    console.log(chalk.yellow.bold('  No transaction was signed or sent.'));
+    console.log('');
   }
 
   /** Confirmation via pendingConfirmation callback */
